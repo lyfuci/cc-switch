@@ -78,7 +78,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          $VERSION = 'wsl-preview-4'
+          $VERSION = 'wsl-preview-5'
           $targetRoot = 'src-tauri/target/release'
           if (-not (Test-Path $targetRoot)) {
             $targetRoot = 'src-tauri/target/x86_64-pc-windows-msvc/release'
@@ -131,7 +131,7 @@ jobs:
       - name: Publish GitHub prerelease
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: wsl-preview-4
+          tag_name: wsl-preview-5
           name: WSL preview build (unsigned) — PR #1
           target_commitish: ${{ github.sha }}
           prerelease: true
@@ -139,7 +139,7 @@ jobs:
           body: |
             Unsigned Windows x64 test build of the WSL Claude official multi-account work from PR #1 (`cursor/wsl-claude-login-terminal-ef30`).
 
-            This build adds official-account card switching inside the distro. Login and Open Terminal from wsl-preview-3 stay.
+            This build fixes the save dialog that said Claude Code was refreshing its sign-in when the backup directory did not exist yet. Card switching from wsl-preview-4 is otherwise the same.
 
             **Not an official release.** Built from fork branch `build/wsl-preview` for local testing only.
 
