@@ -68,7 +68,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # Fork has no TAURI_SIGNING_PRIVATE_KEY; disable updater artifact signing.
-          pnpm tauri build --bundles msi --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}'
+          $json = '{"bundle":{"createUpdaterArtifacts":false}}'
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'tauri.preview.json'), $json)
+          Get-Content tauri.preview.json
+          pnpm tauri build --bundles msi --config tauri.preview.json
 
       - name: Prepare release assets
         shell: pwsh
