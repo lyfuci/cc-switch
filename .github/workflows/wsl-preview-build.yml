@@ -27,7 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: cursor/agy-wsl-config-dir-b5a1
+          ref: cursor/agy-subagent-model-b5a1
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -86,7 +86,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          $VERSION = 'agy-wsl-preview-2'
+          $VERSION = 'agy-wsl-preview-3'
           $targetRoot = 'src-tauri/target/release'
           if (-not (Test-Path $targetRoot)) {
             $targetRoot = 'src-tauri/target/x86_64-pc-windows-msvc/release'
@@ -139,8 +139,8 @@ jobs:
       - name: Publish GitHub prerelease
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: agy-wsl-preview-2
-          name: Antigravity WSL preview (unsigned) — agy-wsl-preview-2
+          tag_name: agy-wsl-preview-3
+          name: Antigravity WSL preview (unsigned) — agy-wsl-preview-3
           target_commitish: ${{ github.sha }}
           prerelease: true
           make_latest: false
@@ -148,6 +148,8 @@ jobs:
             Unsigned Windows x64 test build of Antigravity WSL config-directory support.
 
             In Settings → 应用配置, set Antigravity's config directory to the WSL `.gemini` root, for example `\\wsl.localhost\Ubuntu-26.04\home\sean\.gemini`. CC Switch then reads and writes that tree (settings, MCP, skills, prompts, sessions, usage) and runs agy through `wsl.exe -d Ubuntu-26.04`.
+
+            Subagent usage rows take their model from the child's `conversations/<id>.db` (copied off the WSL share before SQLite opens it). If that database has no model, the row uses the parent's model from just before the child started. The next usage sync updates rows that were stored as `unknown`.
 
             **Not an official release.** Built from this fork for local testing only.
 
