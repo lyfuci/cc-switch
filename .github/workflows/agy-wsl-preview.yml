@@ -6,9 +6,7 @@ name: AGY WSL Preview Build (unsigned)
 on:
   push:
     branches:
-      - cursor/agy-wsl-config-dir-b5a1
-    tags:
-      - "agy-wsl-preview-*"
+      - "cursor/agy-wsl-config-dir-b5a1"
   workflow_dispatch:
 
 permissions:
@@ -83,7 +81,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          $VERSION = '${{ github.ref_type == 'tag' && github.ref_name || 'agy-wsl-preview-1' }}'
+          $VERSION = 'agy-wsl-preview-1'
           $targetRoot = 'src-tauri/target/release'
           if (-not (Test-Path $targetRoot)) {
             $targetRoot = 'src-tauri/target/x86_64-pc-windows-msvc/release'
@@ -136,7 +134,7 @@ jobs:
       - name: Publish GitHub prerelease
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'agy-wsl-preview-1' }}
+          tag_name: agy-wsl-preview-1
           name: Antigravity WSL preview (unsigned) — agy-wsl-preview-1
           target_commitish: ${{ github.sha }}
           prerelease: true
