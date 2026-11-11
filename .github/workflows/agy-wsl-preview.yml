@@ -1,9 +1,12 @@
 name: AGY WSL Preview Build (unsigned)
 
-# Unsigned Windows x64 build for local testing. Push a tag agy-wsl-preview-*
-# (for example agy-wsl-preview-1) to publish a prerelease on this fork.
+# Unsigned Windows x64 build for local testing.
+# Tag pushes only run after this file is on the default branch, so a push of the
+# feature branch starts the build the same way `build/wsl-preview` did.
 on:
   push:
+    branches:
+      - cursor/agy-wsl-config-dir-b5a1
     tags:
       - "agy-wsl-preview-*"
   workflow_dispatch:
@@ -80,10 +83,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          $VERSION = '${{ github.ref_name }}'
-          if ($VERSION -eq '' -or $VERSION -eq 'main') {
-            $VERSION = 'agy-wsl-preview'
-          }
+          $VERSION = '${{ github.ref_type == 'tag' && github.ref_name || 'agy-wsl-preview-1' }}'
           $targetRoot = 'src-tauri/target/release'
           if (-not (Test-Path $targetRoot)) {
             $targetRoot = 'src-tauri/target/x86_64-pc-windows-msvc/release'
@@ -136,8 +136,8 @@ jobs:
       - name: Publish GitHub prerelease
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Antigravity WSL preview (unsigned) — ${{ github.ref_name }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'agy-wsl-preview-1' }}
+          name: Antigravity WSL preview (unsigned) — agy-wsl-preview-1
           target_commitish: ${{ github.sha }}
           prerelease: true
           make_latest: false
