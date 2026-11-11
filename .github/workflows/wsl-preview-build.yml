@@ -1,4 +1,4 @@
-name: AGY WSL Preview Build (unsigned)
+name: WSL Preview Build (unsigned)
 
 # Unsigned Windows x64 build for local testing.
 # Tag pushes only run after this file is on the default branch, so a push of the
