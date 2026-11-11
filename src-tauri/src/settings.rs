@@ -633,6 +633,10 @@ pub struct AppSettings {
     /// DeepSeek Harness 主目录（相当于 `DSH_HOME`，优先于环境变量）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dsh_config_dir: Option<String>,
+    /// Antigravity 的 `.gemini` 根目录（其下是 `antigravity-cli/` 和 `config/`）。
+    /// 指向 `\\wsl.localhost\<发行版>\...` 时，版本、安装和打开终端都进那个发行版里的 agy。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_config_dir: Option<String>,
 
     // ===== 当前供应商 ID（设备级）=====
     /// 当前 Claude 供应商 ID（本地存储，优先于数据库 is_current）
@@ -782,6 +786,7 @@ impl Default for AppSettings {
             pi_config_dir: None,
             omp_config_dir: None,
             dsh_config_dir: None,
+            agy_config_dir: None,
             current_provider_claude: None,
             current_provider_claude_desktop: None,
             current_provider_codex: None,
@@ -887,6 +892,13 @@ impl AppSettings {
 
         self.dsh_config_dir = self
             .dsh_config_dir
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        self.agy_config_dir = self
+            .agy_config_dir
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
@@ -1418,6 +1430,14 @@ pub fn get_dsh_override_dir() -> Option<PathBuf> {
         .map(|path| resolve_override_path(path))
 }
 
+pub fn get_agy_override_dir() -> Option<PathBuf> {
+    let settings = settings_store().read().ok()?;
+    settings
+        .agy_config_dir
+        .as_ref()
+        .map(|path| resolve_override_path(path))
+}
+
 pub fn preserve_codex_official_auth_on_switch() -> bool {
     settings_store()
         .read()
@@ -1704,6 +1724,37 @@ pub fn update_s3_sync_status(status: WebDavSyncStatus) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use crate::app_config::AppType;
+
+    #[test]
+    fn agy_config_dir_round_trips_and_blank_is_cleared() {
+        let saved: AppSettings = serde_json::from_value(serde_json::json!({
+            "agyConfigDir": r"  \\wsl.localhost\Ubuntu-26.04\home\sean\.gemini  "
+        }))
+        .expect("parse settings");
+        assert_eq!(
+            saved.agy_config_dir.as_deref(),
+            Some(r"  \\wsl.localhost\Ubuntu-26.04\home\sean\.gemini  ")
+        );
+        let mut normalized = saved.clone();
+        normalized.normalize_paths();
+        assert_eq!(
+            normalized.agy_config_dir.as_deref(),
+            Some(r"\\wsl.localhost\Ubuntu-26.04\home\sean\.gemini")
+        );
+        assert_eq!(
+            serde_json::to_value(&normalized).expect("serialize")["agyConfigDir"],
+            serde_json::json!(r"\\wsl.localhost\Ubuntu-26.04\home\sean\.gemini")
+        );
+
+        let mut blank = AppSettings::default();
+        blank.agy_config_dir = Some("   ".into());
+        blank.normalize_paths();
+        assert!(blank.agy_config_dir.is_none());
+        assert!(serde_json::to_value(&blank)
+            .expect("serialize")
+            .get("agyConfigDir")
+            .is_none());
+    }
 
     #[test]
     fn russian_language_survives_normalization() {
