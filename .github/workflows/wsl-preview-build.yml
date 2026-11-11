@@ -7,6 +7,9 @@ on:
   push:
     branches:
       - "cursor/agy-wsl-preview-runner-b5a1"
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
