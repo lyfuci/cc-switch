@@ -86,7 +86,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          $VERSION = 'agy-wsl-preview-1'
+          $VERSION = 'agy-wsl-preview-2'
           $targetRoot = 'src-tauri/target/release'
           if (-not (Test-Path $targetRoot)) {
             $targetRoot = 'src-tauri/target/x86_64-pc-windows-msvc/release'
@@ -139,8 +139,8 @@ jobs:
       - name: Publish GitHub prerelease
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: agy-wsl-preview-1
-          name: Antigravity WSL preview (unsigned) — agy-wsl-preview-1
+          tag_name: agy-wsl-preview-2
+          name: Antigravity WSL preview (unsigned) — agy-wsl-preview-2
           target_commitish: ${{ github.sha }}
           prerelease: true
           make_latest: false
