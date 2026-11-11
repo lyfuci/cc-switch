@@ -637,6 +637,10 @@ mod tests {
         assert!(paths
             .summaries
             .ends_with(Path::new("antigravity-cli").join("conversation_summaries.db")));
+        assert!(crate::config::is_wsl_path(&paths.mcp));
+        assert!(crate::config::is_wsl_path(&paths.skills));
+        assert!(crate::config::is_wsl_path(&paths.prompts));
+        assert!(crate::config::is_wsl_path(&paths.settings));
 
         let home = PathBuf::from("/home/sean");
         assert_eq!(
@@ -644,6 +648,99 @@ mod tests {
             home.join(".gemini")
         );
         assert_eq!(agy_gemini_root_from(Some(root.clone()), home), root);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn override_directory_receives_mcp_prompts_and_skills() {
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("CC_SWITCH_TEST_HOME");
+        std::env::set_var("CC_SWITCH_TEST_HOME", home.path());
+        crate::settings::reload_settings().unwrap();
+        let restore = || {
+            match &previous {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+            let _ = crate::settings::reload_settings();
+        };
+
+        let run = || {
+            let root = home.path().join("gemini-root");
+            let mut settings = crate::settings::get_settings();
+            settings.agy_config_dir = Some(root.to_string_lossy().into_owned());
+            crate::settings::update_settings(settings).unwrap();
+
+            crate::mcp::agy::sync("srv", Some(&json!({"command":"echo","args":["hi"]}))).unwrap();
+            let mcp_path = root.join("config").join("mcp_config.json");
+            let mcp = fs::read_to_string(&mcp_path).unwrap();
+            assert!(mcp.contains("echo"), "{mcp}");
+            crate::mcp::agy::sync("srv", None).unwrap();
+            let disabled: Value =
+                serde_json::from_str(&fs::read_to_string(&mcp_path).unwrap()).unwrap();
+            assert_eq!(disabled["mcpServers"]["srv"]["disabled"], json!(true));
+            crate::mcp::agy::sync_and_commit("srv", crate::mcp::agy::AgyChange::Remove, || {
+                Ok::<(), crate::error::AppError>(())
+            })
+            .unwrap();
+            let removed: Value =
+                serde_json::from_str(&fs::read_to_string(&mcp_path).unwrap()).unwrap();
+            assert!(removed["mcpServers"].get("srv").is_none());
+
+            let state = crate::store::AppState::new(std::sync::Arc::new(
+                crate::database::Database::memory().unwrap(),
+            ));
+            fs::write(
+                &mcp_path,
+                r#"{"mcpServers":{"imported":{"command":"tool","disabled":false}}}"#,
+            )
+            .unwrap();
+            assert_eq!(crate::mcp::agy::import(&state).unwrap(), 1);
+
+            let prompt_path =
+                crate::prompt_files::prompt_file_path(&crate::app_config::AppType::Agy).unwrap();
+            assert_eq!(prompt_path, root.join("config").join("AGENTS.md"));
+            crate::services::prompt::PromptService::upsert_prompt(
+                &state,
+                crate::app_config::AppType::Agy,
+                "p1",
+                crate::prompt::Prompt {
+                    id: "p1".into(),
+                    name: "Note".into(),
+                    content: "hello agy".into(),
+                    description: None,
+                    enabled: true,
+                    created_at: Some(1),
+                    updated_at: Some(1),
+                },
+            )
+            .unwrap();
+            assert_eq!(fs::read_to_string(&prompt_path).unwrap(), "hello agy");
+
+            let ssot = crate::services::skill::SkillService::get_ssot_dir()
+                .unwrap()
+                .join("wsl-skill");
+            fs::create_dir_all(&ssot).unwrap();
+            fs::write(ssot.join("SKILL.md"), "name: wsl-skill\n").unwrap();
+            crate::services::skill::SkillService::sync_to_app_dir(
+                "wsl-skill",
+                &crate::app_config::AppType::Agy,
+            )
+            .unwrap();
+            let installed = root
+                .join("config")
+                .join("skills")
+                .join("wsl-skill")
+                .join("SKILL.md");
+            let body = fs::read_to_string(&installed).unwrap();
+            assert!(body.contains("wsl-skill"), "{body}");
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+        restore();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]

@@ -30,26 +30,24 @@ pub fn get_home_dir() -> PathBuf {
     })
 }
 
-/// 检测路径是否为 WSL 网络路径（如 \\wsl$\Ubuntu\... 或 \\wsl.localhost\Ubuntu\...）
-/// 注意：仅检测直接 UNC 路径，映射磁盘符（如 Z: -> \\wsl$\...）无法检测
-#[cfg(windows)]
+/// 检测路径是否为 WSL 网络路径（如 `\\wsl$\Ubuntu\...` 或 `\\wsl.localhost\Ubuntu\...`）。
+/// 映射盘符（如 `Z:` → `\\wsl$\...`）认不出来。字符串形态在非 Windows 上也能认，
+/// 这样技能同步对 UNC 目标走复制，测试不必真的挂载 WSL。
 pub(crate) fn is_wsl_path(path: &Path) -> bool {
-    use std::path::Prefix;
-    if let Some(Component::Prefix(prefix)) = path.components().next() {
-        match prefix.kind() {
-            Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _) => {
-                let s = server.to_string_lossy();
-                s.eq_ignore_ascii_case("wsl$") || s.eq_ignore_ascii_case("wsl.localhost")
-            }
-            _ => false,
-        }
-    } else {
-        false
+    if wsl_unc_to_linux(&path.to_string_lossy()).is_some() {
+        return true;
     }
-}
-
-#[cfg(not(windows))]
-pub(crate) fn is_wsl_path(_path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            if let Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _) = prefix.kind() {
+                let server = server.to_string_lossy();
+                return server.eq_ignore_ascii_case("wsl$")
+                    || server.eq_ignore_ascii_case("wsl.localhost");
+            }
+        }
+    }
     false
 }
 
