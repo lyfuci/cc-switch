@@ -53,6 +53,75 @@ pub(crate) fn is_wsl_path(_path: &Path) -> bool {
     false
 }
 
+/// `\\wsl.localhost\<distro>\home\...`, `\\wsl$\<distro>\...`, `//wsl.localhost/...`,
+/// and `\\?\UNC\wsl.localhost\...`. Returns `(distro, /linux/path)`.
+pub(crate) fn wsl_unc_to_linux(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let slashed = trimmed.replace('/', "\\");
+    let verbatim = r"\\?\UNC\";
+    let normalized = if slashed.len() >= verbatim.len()
+        && slashed[..verbatim.len()].eq_ignore_ascii_case(verbatim)
+    {
+        format!(r"\\{}", &slashed[verbatim.len()..])
+    } else {
+        slashed
+    };
+    let rest = normalized.strip_prefix(r"\\")?;
+    let mut parts = rest.split('\\').filter(|part| !part.is_empty());
+    let server = parts.next()?;
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return None;
+    }
+    let distro = parts.next()?.to_string();
+    if !is_wsl_distro_name(&distro) {
+        return None;
+    }
+    let mut linux = String::new();
+    for part in parts {
+        if part == "." || part == ".." {
+            return None;
+        }
+        linux.push('/');
+        linux.push_str(part);
+    }
+    if linux.is_empty() {
+        return None;
+    }
+    Some((distro, linux))
+}
+
+fn is_wsl_distro_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// A WSL UNC path in `distro`, or a Windows drive path (`C:\...` → `/mnt/c/...`).
+#[cfg(any(windows, test))]
+pub(crate) fn path_into_wsl(raw: &str, distro: &str) -> Option<String> {
+    if let Some((found, linux)) = wsl_unc_to_linux(raw) {
+        return found.eq_ignore_ascii_case(distro).then_some(linux);
+    }
+    let normalized = raw.trim().replace('/', "\\");
+    let mut chars = normalized.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
+        return None;
+    }
+    let rest = normalized[2..].trim_start_matches('\\');
+    let mut linux = format!("/mnt/{}", drive.to_ascii_lowercase());
+    if !rest.is_empty() {
+        linux.push('/');
+        linux.push_str(&rest.replace('\\', "/"));
+    }
+    Some(linux)
+}
+
 /// 临时目录在 WSL 共享路径上时（WSL2 夜间测试），SQLite 拿不到文件锁，
 /// 在磁盘上建 SQLite 夹具的测试只能跳过。
 #[cfg(test)]

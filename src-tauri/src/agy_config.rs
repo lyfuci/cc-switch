@@ -27,18 +27,56 @@ use crate::error::AppError;
 use crate::live::patch::json::JsonPatch;
 use crate::live::patch::{KeyPath, LivePatch};
 
-/// `~/.gemini/antigravity-cli`
+/// Antigravity 的 `.gemini` 根。设置里的覆盖就是这个目录：下面同时有
+/// `antigravity-cli/`（settings、会话、用量）和 `config/`（MCP、Skills、提示词）。
+/// 不设时仍是本机 `~/.gemini`，和 Gemini CLI 自己的覆盖互不影响。
+pub fn agy_gemini_root() -> PathBuf {
+    agy_gemini_root_from(crate::settings::get_agy_override_dir(), get_home_dir())
+}
+
+pub(crate) fn agy_gemini_root_from(override_dir: Option<PathBuf>, home: PathBuf) -> PathBuf {
+    override_dir.unwrap_or_else(|| home.join(".gemini"))
+}
+
+/// 覆盖目录（或默认 `~/.gemini`）下 agy 会读写的路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgyPaths {
+    pub settings: PathBuf,
+    pub mcp: PathBuf,
+    pub skills: PathBuf,
+    pub prompts: PathBuf,
+    pub sessions: PathBuf,
+    pub ide_sessions: PathBuf,
+    pub summaries: PathBuf,
+}
+
+pub(crate) fn agy_paths(root: &Path) -> AgyPaths {
+    let cli = root.join("antigravity-cli");
+    let config = root.join("config");
+    AgyPaths {
+        settings: cli.join("settings.json"),
+        mcp: config.join("mcp_config.json"),
+        skills: config.join("skills"),
+        prompts: config.join("AGENTS.md"),
+        sessions: cli.join("brain"),
+        ide_sessions: root.join("antigravity").join("brain"),
+        summaries: cli.join("conversation_summaries.db"),
+    }
+}
+
+/// `~/.gemini/antigravity-cli`，或覆盖根下的同名目录。
 pub fn agy_dir() -> PathBuf {
-    get_home_dir().join(".gemini").join("antigravity-cli")
+    agy_gemini_root().join("antigravity-cli")
 }
 
 /// `~/.gemini/config`：CLI、桌面版和 IDE 共用的 MCP / Skills / 提示词目录。
+/// 跟随 Antigravity 自己的覆盖，不跟随 Gemini CLI 的覆盖。
 pub fn customizations_dir() -> PathBuf {
-    get_home_dir().join(".gemini").join("config")
+    agy_gemini_root().join("config")
 }
 
 pub fn settings_path() -> PathBuf {
-    agy_dir().join("settings.json")
+    agy_paths(&agy_gemini_root()).settings
 }
 
 /// Key 模式各供应商私有 `--gemini_dir` 的上级目录。
@@ -243,6 +281,11 @@ fn prepare_key_profile(dir: &Path, projection: &AgyProjection) -> Result<(), App
 /// 那是 agy 自己建的，里面可能有用户的东西。
 fn link_shared_config(link: &Path, target: &Path) -> Result<(), AppError> {
     fs::create_dir_all(target).map_err(|e| AppError::io(target, e))?;
+    // Windows 到 `\\wsl.localhost\...` 的 junction 建不成。目录在发行版里时，打开终端的
+    // 命令会在 WSL 里 `ln -sfn`，这里不再尝试从 Windows 连过去。
+    if crate::config::wsl_unc_to_linux(&target.to_string_lossy()).is_some() {
+        return Ok(());
+    }
     match fs::symlink_metadata(link) {
         Ok(meta) if meta.file_type().is_symlink() => {
             if fs::read_link(link).ok().as_deref() == Some(target) {
@@ -553,6 +596,54 @@ mod tests {
             .apply(Path::new("settings.json"), Some(before.as_bytes()))
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn wsl_gemini_root_keeps_settings_mcp_skills_prompts_and_sessions_under_it() {
+        let root = PathBuf::from(r"\\wsl.localhost\Ubuntu-26.04\home\sean\.gemini");
+        let paths = agy_paths(&root);
+        for path in [
+            &paths.settings,
+            &paths.mcp,
+            &paths.skills,
+            &paths.prompts,
+            &paths.sessions,
+            &paths.ide_sessions,
+            &paths.summaries,
+        ] {
+            assert!(
+                path.starts_with(&root),
+                "{} is not under {}",
+                path.display(),
+                root.display()
+            );
+        }
+        assert!(paths
+            .settings
+            .ends_with(Path::new("antigravity-cli").join("settings.json")));
+        assert!(paths
+            .mcp
+            .ends_with(Path::new("config").join("mcp_config.json")));
+        assert!(paths.skills.ends_with(Path::new("config").join("skills")));
+        assert!(paths
+            .prompts
+            .ends_with(Path::new("config").join("AGENTS.md")));
+        assert!(paths
+            .sessions
+            .ends_with(Path::new("antigravity-cli").join("brain")));
+        assert!(paths
+            .ide_sessions
+            .ends_with(Path::new("antigravity").join("brain")));
+        assert!(paths
+            .summaries
+            .ends_with(Path::new("antigravity-cli").join("conversation_summaries.db")));
+
+        let home = PathBuf::from("/home/sean");
+        assert_eq!(
+            agy_gemini_root_from(None, home.clone()),
+            home.join(".gemini")
+        );
+        assert_eq!(agy_gemini_root_from(Some(root.clone()), home), root);
     }
 
     #[test]
