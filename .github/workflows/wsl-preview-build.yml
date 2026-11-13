@@ -27,7 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: cursor/agy-subagent-model-b5a1
+          ref: 72707cf3e5811a14e509987001ce4b4fc9018342
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -86,7 +86,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          $VERSION = 'agy-wsl-preview-3'
+          $VERSION = 'agy-wsl-preview-4'
           $targetRoot = 'src-tauri/target/release'
           if (-not (Test-Path $targetRoot)) {
             $targetRoot = 'src-tauri/target/x86_64-pc-windows-msvc/release'
@@ -139,13 +139,13 @@ jobs:
       - name: Publish GitHub prerelease
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: agy-wsl-preview-3
-          name: Antigravity WSL preview (unsigned) — agy-wsl-preview-3
+          tag_name: agy-wsl-preview-4
+          name: Antigravity WSL preview (unsigned) — agy-wsl-preview-4
           target_commitish: ${{ github.sha }}
           prerelease: true
           make_latest: false
           body: |
-            Unsigned Windows x64 test build of Antigravity WSL config-directory support.
+            Unsigned Windows x64 test build of `72707cf3` on `cursor/agy-wsl-config-dir-upstream-b5a1` (rebased onto upstream `db7a0e75`).
 
             In Settings → 应用配置, set Antigravity's config directory to the WSL `.gemini` root, for example `\\wsl.localhost\Ubuntu-26.04\home\sean\.gemini`. CC Switch then reads and writes that tree (settings, MCP, skills, prompts, sessions, usage) and runs agy through `wsl.exe -d Ubuntu-26.04`.
 
