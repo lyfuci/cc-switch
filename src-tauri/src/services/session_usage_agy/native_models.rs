@@ -91,7 +91,15 @@ pub(super) struct Timing {
 
 #[derive(Default)]
 pub(super) struct Generation {
+    /// First usable raw string, field 21 then field 19. Kept for callers that
+    /// only need one label.
     pub model: Option<String>,
+    /// `gen_metadata.data` response field 21. Tiered id (`gemini-4-argon-high`)
+    /// or, in an Orchestrator conversation, the selector (`gemini-pro-orchestrator`).
+    pub model_id: Option<String>,
+    /// `gen_metadata.data` response field 19. Base model (`gemini-4-carbon`,
+    /// `gemini-flash-worker-agy`).
+    pub model_name: Option<String>,
     pub timing: Option<Timing>,
 }
 
@@ -222,22 +230,36 @@ fn read_generations(path: &Path, steps: &[u64]) -> Result<HashMap<u64, Generatio
         let Some(bytes) = data else {
             continue;
         };
-        let tiered = GenerationModelId::decode(bytes.as_slice())
+        let usable = |raw: String| {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+                None
+            } else {
+                Some(trimmed)
+            }
+        };
+        // Field 21 and field 19 are separate messages so a selector in 21 cannot
+        // hide the base model in 19, and a bad wire type in one cannot hide the other.
+        let model_id = GenerationModelId::decode(bytes.as_slice())
             .ok()
             .and_then(|metadata| metadata.response)
-            .map(|response| response.model_id);
-        let base = GenerationMetadata::decode(bytes.as_slice())
+            .and_then(|response| usable(response.model_id));
+        let model_name = GenerationMetadata::decode(bytes.as_slice())
             .ok()
             .and_then(|metadata| metadata.response)
-            .map(|response| response.model);
-        let model = [tiered, base]
-            .into_iter()
-            .flatten()
-            .map(|model| model.trim().to_string())
-            .find(|model| !model.is_empty() && !model.eq_ignore_ascii_case("unknown"));
+            .and_then(|response| usable(response.model));
+        let model = model_id.clone().or(model_name.clone());
         let timing = timing_of(&bytes);
         if model.is_some() || timing.is_some() {
-            generations.insert(step, Generation { model, timing });
+            generations.insert(
+                step,
+                Generation {
+                    model,
+                    model_id,
+                    model_name,
+                    timing,
+                },
+            );
         }
     }
     Ok(generations)

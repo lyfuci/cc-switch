@@ -54,11 +54,17 @@ fn sync_agy_usage_from_files(
         let modified = metadata_modified_nanos(&metadata);
         let size = metadata.len() as i64;
         let native_state = native_models::native_state_fingerprint(&path);
-        if cursor.is_some_and(|c| {
-            c.last_modified == modified
-                && c.last_byte_offset == Some(size)
-                && c.parser_state.as_deref() == Some(native_state.as_str())
-        }) {
+        // Rows stored as the Orchestrator selector (or the raw worker alias) are
+        // not finished. Re-read them even when the transcript and database are
+        // unchanged, the same way an `unknown` row is replaced once a model exists.
+        let selector_rows = session_stores_orchestrator_label(db, &session_id)?;
+        if !selector_rows
+            && cursor.is_some_and(|c| {
+                c.last_modified == modified
+                    && c.last_byte_offset == Some(size)
+                    && c.parser_state.as_deref() == Some(native_state.as_str())
+            })
+        {
             continue;
         }
         match agy::records(&path) {
@@ -87,6 +93,24 @@ fn sync_agy_usage_from_files(
         }
     }
     Ok(result)
+}
+
+fn session_stores_orchestrator_label(db: &Database, session: &str) -> Result<bool, AppError> {
+    let conn = lock_conn!(db.conn);
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM proxy_request_logs
+            WHERE session_id=?1 AND app_type='agy' AND (
+                model LIKE 'orchestrator%'
+                OR model LIKE 'gemini-pro-orchestrator%'
+                OR lower(model)='orchestrator'
+                OR model='gemini-flash-worker-agy'
+            )
+        )",
+        [session],
+        |row| row.get(0),
+    )
+    .map_err(|err| AppError::Database(err.to_string()))
 }
 
 /// agy 把模型切换写进会话正文：`changed setting \`Model Selection\` from X to Y`。
@@ -183,22 +207,23 @@ fn import_records_with_cursor(
     transcript: Option<&Path>,
     sync_cursor: Option<AgySyncCursorUpdate<'_>>,
 ) -> Result<(u32, u32), AppError> {
-    // step_index 顺序决定模型归属：先按顺序扫一遍切换事件，再给每个响应打上当时的模型。
+    // 会话级 Model Selection 只作兜底。Orchestrator 一场对话里规划步和执行步模型不同，
+    // 以这一步自己的记录和 gen_metadata 为准。
     let mut ordered: Vec<&Value> = rows.iter().collect();
     ordered.sort_by_key(|row| row["step_index"].as_u64().unwrap_or(u64::MAX));
-    let mut current_model: Option<String> = None;
-    let mut model_by_step = std::collections::HashMap::<u64, String>::new();
+    let mut current_selection: Option<String> = None;
+    let mut selection_by_step = std::collections::HashMap::<u64, String>::new();
     for row in &ordered {
         let Some(step) = row["step_index"].as_u64() else {
             continue;
         };
         if row["type"] == "USER_INPUT" {
             if let Some(model) = row["content"].as_str().and_then(model_from_settings_change) {
-                current_model = Some(model);
+                current_selection = Some(model);
             }
         } else if row["type"] == "PLANNER_RESPONSE" {
-            if let Some(model) = &current_model {
-                model_by_step.entry(step).or_insert_with(|| model.clone());
+            if let Some(model) = &current_selection {
+                selection_by_step.insert(step, model.clone());
             }
         }
     }
@@ -206,6 +231,7 @@ fn import_records_with_cursor(
     // 子代理通常没有 Model Selection；按步骤关联原生生成记录，不推测档位映射。
     // 耗时和首字也只在原生库里有（transcript 的时间戳只到秒、没有完成时间）。
     let mut timing_by_step = std::collections::HashMap::new();
+    let mut native_by_step = std::collections::HashMap::new();
     let mut native_ok = true;
     if let Some(transcript) = transcript {
         let settled = steps_with_timing(db, session, &ordered)?;
@@ -214,7 +240,7 @@ fn import_records_with_cursor(
             .filter(|row| row["type"] == "PLANNER_RESPONSE" && row["status"] == "DONE")
             .filter_map(|row| {
                 let step = row["step_index"].as_u64()?;
-                let needs_model = known_model(row).is_none() && !model_by_step.contains_key(&step);
+                let needs_model = row_real_model(row).is_none();
                 (needs_model || !settled.contains(&step)).then_some(step)
             })
             .collect();
@@ -222,12 +248,10 @@ fn import_records_with_cursor(
             match native_models::generations_for_transcript(transcript, &wanted) {
                 Ok(generations) => {
                     for (step, generation) in generations {
-                        if let Some(model) = generation.model {
-                            model_by_step.entry(step).or_insert(model);
-                        }
                         if let Some(timing) = generation.timing {
                             timing_by_step.insert(step, timing);
                         }
+                        native_by_step.insert(step, generation);
                     }
                 }
                 Err(error) => {
@@ -235,6 +259,34 @@ fn import_records_with_cursor(
                     log::warn!("Antigravity {session}: cannot read native models: {error}");
                 }
             }
+        }
+    }
+
+    let mut model_by_step = std::collections::HashMap::<u64, (String, String)>::new();
+    for row in &ordered {
+        if row["type"] != "PLANNER_RESPONSE" || row["status"] != "DONE" {
+            continue;
+        }
+        let Some(step) = row["step_index"].as_u64() else {
+            continue;
+        };
+        let mut candidates = Vec::new();
+        if let Some(raw) = row["model"].as_str() {
+            candidates.push(raw);
+        }
+        if let Some(generation) = native_by_step.get(&step) {
+            if let Some(model_id) = generation.model_id.as_deref() {
+                candidates.push(model_id);
+            }
+            if let Some(model_name) = generation.model_name.as_deref() {
+                candidates.push(model_name);
+            }
+        }
+        if let Some(selection) = selection_by_step.get(&step) {
+            candidates.push(selection.as_str());
+        }
+        if let Some(resolved) = resolve_step_model(&candidates) {
+            model_by_step.insert(step, resolved);
         }
     }
 
@@ -256,8 +308,12 @@ fn import_records_with_cursor(
                 native_ok = false;
             }
             if let Some(model) = model {
-                for step in missing {
-                    model_by_step.entry(step).or_insert_with(|| model.clone());
+                if let Some(resolved) = resolve_step_model(&[model.as_str()]) {
+                    for step in missing {
+                        model_by_step
+                            .entry(step)
+                            .or_insert_with(|| resolved.clone());
+                    }
                 }
             }
         }
@@ -292,12 +348,12 @@ fn import_records_with_cursor(
         let fresh = tx
             .prepare_cached("INSERT OR IGNORE INTO session_usage_dedup(data_source,request_id,semantic_id,has_entry_id) VALUES ('agy_session',?1,?1,1)")?
             .execute([&id])?;
-        // `model` 存 ID（对得上定价和其它应用的统计），`request_model` 留显示名。
-        let display = known_model(row)
-            .map(str::to_string)
-            .or_else(|| model_by_step.get(&step).cloned())
-            .unwrap_or_else(|| "unknown".to_string());
-        let model = model_id_of(&display);
+        // `model` 存规范化后的 ID，`request_model` 留这一步实际命中的原始名字
+        // （显示名或字段里的 id）。Orchestrator 选择器不会留在这两列里。
+        let (model, display) = model_by_step
+            .get(&step)
+            .cloned()
+            .unwrap_or_else(|| ("unknown".into(), "unknown".into()));
         // 原生库暂时不可读时，保留已恢复的模型；Token 仍按最新日志更新。
         let (model, display) = if model == "unknown" && fresh == 0 {
             tx.prepare_cached(
@@ -474,10 +530,63 @@ fn model_active_before(events: &[(i64, String)], child_start: Option<i64>) -> Op
     best.map(|(_, model)| model.to_string())
 }
 
-fn known_model(row: &Value) -> Option<&str> {
-    row["model"]
-        .as_str()
-        .filter(|model| !model.trim().is_empty() && !model.eq_ignore_ascii_case("unknown"))
+enum AgyModelClass {
+    /// A model id the rest of the app can price or display.
+    Real(String),
+    /// Orchestrator is a mode. `planner` is Gemini 4 Carbon or Argon when the
+    /// label says which one.
+    Selector { planner: Option<&'static str> },
+}
+
+fn classify_agy_model(raw: &str) -> Option<AgyModelClass> {
+    let id = model_id_of(raw.trim());
+    if id.is_empty() || id.eq_ignore_ascii_case("unknown") || id.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    Some(match id.to_ascii_lowercase().as_str() {
+        // Antigravity names the Hydrogen worker this way inside gen_metadata.
+        "gemini-flash-worker-agy" | "gemini-flash-worker" => {
+            AgyModelClass::Real("gemini-4-hydrogen".into())
+        }
+        // Selector labels. They are not models. The unsuffixed pro-orchestrator
+        // is the Carbon mode; the argon variant names itself.
+        "orchestrator-carbon" | "gemini-pro-orchestrator" => AgyModelClass::Selector {
+            planner: Some("gemini-4-carbon"),
+        },
+        "orchestrator-argon" | "gemini-pro-orchestrator-argon" => AgyModelClass::Selector {
+            planner: Some("gemini-4-argon"),
+        },
+        "orchestrator" => AgyModelClass::Selector { planner: None },
+        _ => AgyModelClass::Real(id),
+    })
+}
+
+fn row_real_model(row: &Value) -> Option<String> {
+    let raw = row["model"].as_str()?;
+    match classify_agy_model(raw) {
+        Some(AgyModelClass::Real(id)) => Some(id),
+        _ => None,
+    }
+}
+
+/// `(model id, display)`. A real per-step string wins, in the order given.
+/// A selector is used only when nothing in the list is a real model, and then
+/// only as its planner (`gemini-4-carbon` or `gemini-4-argon`).
+fn resolve_step_model(candidates: &[&str]) -> Option<(String, String)> {
+    for raw in candidates {
+        if let Some(AgyModelClass::Real(id)) = classify_agy_model(raw) {
+            return Some((id, (*raw).to_string()));
+        }
+    }
+    for raw in candidates {
+        if let Some(AgyModelClass::Selector {
+            planner: Some(planner),
+        }) = classify_agy_model(raw)
+        {
+            return Some((planner.to_string(), planner.to_string()));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -653,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn native_models_do_not_replace_explicit_models_or_selection_events() {
+    fn explicit_row_model_wins_and_a_generation_model_wins_over_selection() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
         }
@@ -681,7 +790,7 @@ mod tests {
         );
         let conn = db.conn.lock().unwrap();
         for (id, expected) in [
-            ("agy:session:1", "gemini-4-argon-medium"),
+            ("agy:session:1", "gemini-3.8-flash-tiered"),
             ("agy:session:3", "explicit-model"),
         ] {
             let model: String = conn
@@ -1208,5 +1317,121 @@ mod tests {
         let from_db = transcript(dir.path(), "from-db");
         import_records(&db, "from-db", &[row(1)], Some(&from_db)).unwrap();
         assert_eq!(stored(&db, "agy:from-db:1"), "gemini-4-argon");
+    }
+
+    #[test]
+    fn orchestrator_labels_are_selectors_and_the_worker_is_hydrogen() {
+        assert_eq!(
+            resolve_step_model(&["gemini-flash-worker-agy"]).unwrap().0,
+            "gemini-4-hydrogen"
+        );
+        // Field 21 selector must not hide field 19's real model.
+        assert_eq!(
+            resolve_step_model(&["gemini-pro-orchestrator", "gemini-4-carbon"])
+                .unwrap()
+                .0,
+            "gemini-4-carbon"
+        );
+        assert_eq!(
+            resolve_step_model(&["orchestrator-carbon"]).unwrap().0,
+            "gemini-4-carbon"
+        );
+        assert_eq!(
+            resolve_step_model(&["gemini-pro-orchestrator-argon"])
+                .unwrap()
+                .0,
+            "gemini-4-argon"
+        );
+        assert_eq!(
+            resolve_step_model(&["Orchestrator (Argon)"]).unwrap().0,
+            "gemini-4-argon"
+        );
+        // The worker on this step wins over the conversation selector.
+        assert_eq!(
+            resolve_step_model(&["Orchestrator (Carbon)", "gemini-flash-worker-agy"])
+                .unwrap()
+                .0,
+            "gemini-4-hydrogen"
+        );
+        assert!(resolve_step_model(&["Orchestrator"]).is_none());
+    }
+
+    #[test]
+    fn orchestrator_steps_use_each_generation_and_old_selector_rows_are_rewritten() {
+        if crate::config::sqlite_unsupported_in_temp_dir() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let brain = dir.path().join("brain");
+        let logs = brain.join("orch/.system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let transcript = logs.join("transcript_full.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-11-12T00:00:00Z","content":"changed setting `Model Selection` from None to Orchestrator (Carbon)."}"#,
+                "\n",
+                r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-12T00:00:01Z","input_tokens":1000,"output_tokens":200}"#,
+                "\n",
+                r#"{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-12T00:00:02Z","input_tokens":800,"output_tokens":300}"#,
+                "\n",
+                r#"{"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-12T00:00:03Z","input_tokens":100,"output_tokens":20}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("conversations")).unwrap();
+        let native = native_models::write_test_database(
+            &dir.path().join("conversations/orch.db"),
+            &[(1, 0, "gemini-4-carbon"), (2, 1, "gemini-flash-worker-agy")],
+        );
+        native_models::set_test_generation(
+            &native,
+            0,
+            "gemini-4-carbon",
+            &native_models::test_model_id("gemini-pro-orchestrator"),
+        );
+        drop(native);
+
+        let db = Database::memory().unwrap();
+        let roots = [(brain, None)];
+        let sync = || sync_agy_usage_from_files(&db, agy::transcript_files_in_roots(&roots));
+        assert_eq!(sync().unwrap().imported, 3);
+        let model = |step: u64| -> (String, String) {
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT model, total_cost_usd FROM proxy_request_logs WHERE request_id=?1",
+                    [format!("agy:orch:{step}")],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        let planner = model(1);
+        assert_eq!(planner.0, "gemini-4-carbon");
+        assert!(planner.1.parse::<f64>().unwrap() > 0.0, "{}", planner.1);
+        let worker = model(2);
+        assert_eq!(worker.0, "gemini-4-hydrogen");
+        // No official Hydrogen price is seeded.
+        assert_eq!(worker.1, "0");
+        // A step with only the conversation selector uses the Carbon planner.
+        assert_eq!(model(3).0, "gemini-4-carbon");
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE proxy_request_logs SET model='orchestrator-carbon', request_model='orchestrator-carbon', total_cost_usd='0' WHERE session_id='orch'",
+                [],
+            )
+            .unwrap();
+        // The transcript and database are unchanged, so the cursor would skip.
+        // Stored selector labels must be read again.
+        assert!(sync().unwrap().imported >= 1);
+        assert_eq!(model(1).0, "gemini-4-carbon");
+        assert_eq!(model(2).0, "gemini-4-hydrogen");
+        assert_eq!(model(3).0, "gemini-4-carbon");
+        assert_eq!(sync().unwrap().imported, 0);
     }
 }
