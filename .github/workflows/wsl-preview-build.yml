@@ -1,0 +1,163 @@
+name: WSL Preview Build (unsigned)
+
+# Unsigned Windows x64 build for local testing.
+# Tag pushes only run after this file is on the default branch, so a push of the
+# feature branch starts the build the same way `build/wsl-preview` did.
+on:
+  push:
+    branches:
+      - "cursor/agy-wsl-preview-runner-b5a1"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agy-wsl-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    name: Build Windows x64 (unsigned)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: e42c167502ff05d3d0c91b77cf4b71c89e437715
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+
+      - name: Setup pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          node --version
+          pnpm --version
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-${{ runner.arch }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-pnpm-store-
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri App (Windows MSI, unsigned)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Fork has no TAURI_SIGNING_PRIVATE_KEY; disable updater artifact signing.
+          $json = '{"bundle":{"createUpdaterArtifacts":false}}'
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'tauri.preview.json'), $json)
+          Get-Content tauri.preview.json
+          pnpm tauri build --bundles msi --config tauri.preview.json
+
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          $VERSION = 'agy-wsl-preview-5'
+          $targetRoot = 'src-tauri/target/release'
+          if (-not (Test-Path $targetRoot)) {
+            $targetRoot = 'src-tauri/target/x86_64-pc-windows-msvc/release'
+          }
+
+          $msi = Get-ChildItem -Path (Join-Path $targetRoot 'bundle/msi') -Recurse -Include *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $msi) {
+            $msi = Get-ChildItem -Path (Join-Path $targetRoot 'bundle') -Recurse -Include *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($null -eq $msi) {
+            Get-ChildItem -Path $targetRoot -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName | Write-Host
+            throw "No Windows MSI installer found under $targetRoot"
+          }
+          $dest = "CC-Switch-$VERSION-Windows.msi"
+          Copy-Item $msi.FullName (Join-Path release-assets $dest)
+          Write-Host "Installer copied: $dest ($([math]::Round($msi.Length/1MB,2)) MB)"
+
+          $exeCandidates = @(
+            (Join-Path $targetRoot 'cc-switch.exe'),
+            'src-tauri/target/release/cc-switch.exe',
+            'src-tauri/target/x86_64-pc-windows-msvc/release/cc-switch.exe'
+          )
+          $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($null -ne $exePath) {
+            $portableDir = 'release-assets/CC-Switch-Portable'
+            New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+            Copy-Item $exePath $portableDir
+            @(
+              '# CC Switch portable build marker (unsigned Antigravity WSL preview)',
+              'portable=true'
+            ) | Set-Content -Path (Join-Path $portableDir 'portable.ini') -Encoding UTF8
+            $portableZip = "release-assets/CC-Switch-$VERSION-Windows-Portable.zip"
+            Compress-Archive -Path "$portableDir/*" -DestinationPath $portableZip -Force
+            Remove-Item -Recurse -Force $portableDir
+            Write-Host "Portable zip created: CC-Switch-$VERSION-Windows-Portable.zip"
+          } else {
+            Write-Warning 'Portable exe not found; MSI only'
+          }
+
+          Get-ChildItem release-assets | Format-Table Name, Length
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: agy-wsl-preview-windows-x64
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: agy-wsl-preview-5
+          name: Antigravity WSL preview (unsigned) — agy-wsl-preview-5
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          body: |
+            Unsigned Windows x64 test build of `e42c1675` on `cursor/agy-orchestrator-models-b5a1`. Orchestrator steps use each generation's own model: Gemini 4 Carbon or Argon for the planner, and Gemini 4 Hydrogen for `gemini-flash-worker-agy`.
+
+            In Settings → 应用配置, set Antigravity's config directory to the WSL `.gemini` root, for example `\\wsl.localhost\Ubuntu-26.04\home\sean\.gemini`. CC Switch then reads and writes that tree (settings, MCP, skills, prompts, sessions, usage) and runs agy through `wsl.exe -d Ubuntu-26.04`.
+
+            Subagent usage rows take their model from the child's `conversations/<id>.db` (copied off the WSL share before SQLite opens it). If that database has no model, the row uses the parent's model from just before the child started. The next usage sync updates rows that were stored as `unknown`.
+
+            **Not an official release.** Built from this fork for local testing only.
+
+            - No code signing / SmartScreen may warn (“Unknown publisher”)
+            - No updater signature (in-app auto-update will not work for this build)
+            - Antigravity account login and account switching inside WSL are not included
+
+            Install with the `.msi`, or unzip the portable `.zip` and run `cc-switch.exe`.
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
