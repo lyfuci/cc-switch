@@ -29,6 +29,8 @@ const DIRECTORY_FIELD: Record<DirectoryAppId, keyof Settings> = {
   hermes: "hermesConfigDir",
   pi: "piConfigDir",
   omp: "ompConfigDir",
+  dsh: "dshConfigDir",
+  agy: "agyConfigDir",
 };
 
 const DIRECTORY_PLACEHOLDER: Record<DirectoryAppId, string> = {
@@ -41,6 +43,8 @@ const DIRECTORY_PLACEHOLDER: Record<DirectoryAppId, string> = {
   hermes: "settings.browsePlaceholderHermes",
   pi: "settings.browsePlaceholderPi",
   omp: "settings.browsePlaceholderOmp",
+  dsh: "settings.browsePlaceholderDsh",
+  agy: "settings.browsePlaceholderAgy",
 };
 
 const DIRECTORY_APPS: DirectoryAppId[] = [
@@ -53,6 +57,8 @@ const DIRECTORY_APPS: DirectoryAppId[] = [
   "hermes",
   "pi",
   "omp",
+  "dsh",
+  "agy",
 ];
 
 const normalizeDir = (value: unknown) =>
@@ -100,7 +106,10 @@ export function AppConfigSection({
       label={t("settings.appConfig.configDir")}
       help={{
         title: t("settings.appConfig.configDir"),
-        body: t("settings.configDirectoryDescription"),
+        body:
+          app === "agy"
+            ? t("settings.agyConfigDirDescription")
+            : t("settings.configDirectoryDescription"),
       }}
     >
       <DirectoryInput

@@ -62,6 +62,8 @@ const DIRECTORY_KEYS = [
   "hermesConfigDir",
   "piConfigDir",
   "ompConfigDir",
+  "dshConfigDir",
+  "agyConfigDir",
 ] as const;
 
 const sanitizeDir = (value?: string | null): string | undefined => {
@@ -135,6 +137,8 @@ export function useSettings(): UseSettingsResult {
       hermes: sanitizeDir(data?.hermesConfigDir),
       pi: sanitizeDir(data?.piConfigDir),
       omp: sanitizeDir(data?.ompConfigDir),
+      dsh: sanitizeDir(data?.dshConfigDir),
+      agy: sanitizeDir(data?.agyConfigDir),
     });
     setRequiresRestart(false);
   }, [
@@ -223,6 +227,8 @@ export function useSettings(): UseSettingsResult {
         );
         const sanitizedPiDir = sanitizeDir(mergedSettings.piConfigDir);
         const sanitizedOmpDir = sanitizeDir(mergedSettings.ompConfigDir);
+        const sanitizedDshDir = sanitizeDir(mergedSettings.dshConfigDir);
+        const sanitizedAgyDir = sanitizeDir(mergedSettings.agyConfigDir);
         const {
           webdavSync: _ignoredWebdavSync,
           s3Sync: _ignoredS3Sync,
@@ -239,6 +245,8 @@ export function useSettings(): UseSettingsResult {
           openclawConfigDir: sanitizedOpenclawDir,
           piConfigDir: sanitizedPiDir,
           ompConfigDir: sanitizedOmpDir,
+          dshConfigDir: sanitizedDshDir,
+          agyConfigDir: sanitizedAgyDir,
           language: mergedSettings.language,
         };
 
@@ -360,6 +368,8 @@ export function useSettings(): UseSettingsResult {
         );
         const sanitizedPiDir = sanitizeDir(mergedSettings.piConfigDir);
         const sanitizedOmpDir = sanitizeDir(mergedSettings.ompConfigDir);
+        const sanitizedDshDir = sanitizeDir(mergedSettings.dshConfigDir);
+        const sanitizedAgyDir = sanitizeDir(mergedSettings.agyConfigDir);
         const previousAppDir = initialAppConfigDir;
         const previousClaudeDir = sanitizeDir(data?.claudeConfigDir);
         const previousCodexDir = sanitizeDir(data?.codexConfigDir);
@@ -369,6 +379,8 @@ export function useSettings(): UseSettingsResult {
         const previousOpenclawDir = sanitizeDir(data?.openclawConfigDir);
         const previousPiDir = sanitizeDir(data?.piConfigDir);
         const previousOmpDir = sanitizeDir(data?.ompConfigDir);
+        const previousDshDir = sanitizeDir(data?.dshConfigDir);
+        const previousAgyDir = sanitizeDir(data?.agyConfigDir);
         const {
           webdavSync: _ignoredWebdavSync,
           s3Sync: _ignoredS3Sync,
@@ -385,6 +397,8 @@ export function useSettings(): UseSettingsResult {
           openclawConfigDir: sanitizedOpenclawDir,
           piConfigDir: sanitizedPiDir,
           ompConfigDir: sanitizedOmpDir,
+          dshConfigDir: sanitizedDshDir,
+          agyConfigDir: sanitizedAgyDir,
           language: mergedSettings.language,
         };
 
@@ -476,6 +490,8 @@ export function useSettings(): UseSettingsResult {
         const openclawDirChanged = sanitizedOpenclawDir !== previousOpenclawDir;
         const piDirChanged = sanitizedPiDir !== previousPiDir;
         const ompDirChanged = sanitizedOmpDir !== previousOmpDir;
+        const dshDirChanged = sanitizedDshDir !== previousDshDir;
+        const agyDirChanged = sanitizedAgyDir !== previousAgyDir;
         if (
           !pluginSynced &&
           (claudeDirChanged ||
@@ -498,6 +514,30 @@ export function useSettings(): UseSettingsResult {
         }
         if (ompDirChanged) {
           await invalidatePiDirectoryCaches(queryClient, "omp");
+        }
+        if (dshDirChanged) {
+          await Promise.all([
+            queryClient.invalidateQueries({ queryKey: ["providers", "dsh"] }),
+            queryClient.invalidateQueries({
+              queryKey: ["skills", "installed"],
+            }),
+            queryClient.invalidateQueries({ queryKey: ["sessions"] }),
+            // DSH_ACCOUNT_STATUS_KEY：登录凭据也在 DSH 主目录里，不刷新会显示旧目录的账号
+            queryClient.invalidateQueries({
+              queryKey: ["dsh-account-status"],
+            }),
+          ]);
+        }
+        if (agyDirChanged) {
+          await Promise.all([
+            queryClient.invalidateQueries({ queryKey: ["providers", "agy"] }),
+            queryClient.invalidateQueries({
+              queryKey: ["skills", "installed"],
+            }),
+            queryClient.invalidateQueries({ queryKey: ["sessions"] }),
+            queryClient.invalidateQueries({ queryKey: ["prompts"] }),
+            queryClient.invalidateQueries({ queryKey: ["mcp", "all"] }),
+          ]);
         }
 
         const appDirChanged = sanitizedAppDir !== (previousAppDir ?? undefined);

@@ -1,7 +1,9 @@
 //! Read per-generation model names from Antigravity's native conversation database.
 use prost::Message;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use std::{collections::HashMap, path::Path, time::Duration};
+#[cfg(test)]
+use rusqlite::Connection;
+use rusqlite::OptionalExtension;
+use std::{collections::HashMap, path::Path};
 
 // Only the fields needed for the step -> generation -> model association are decoded.
 #[derive(Clone, PartialEq, Message)]
@@ -103,10 +105,7 @@ fn timing_of(bytes: &[u8]) -> Option<Timing> {
     })
 }
 
-pub(super) fn generations_for_transcript(
-    transcript: &Path,
-    steps: &[u64],
-) -> Result<HashMap<u64, Generation>, String> {
+fn native_database_path(transcript: &Path) -> Result<Option<std::path::PathBuf>, String> {
     // brain/<id>/.system_generated/logs/transcript_full.jsonl and conversations/<id>.db
     // share the same CLI/IDE/private-profile root.
     let session = transcript
@@ -122,27 +121,81 @@ pub(super) fn generations_for_transcript(
     let id = session.file_name().ok_or("Missing session id")?;
     let path = root.join("conversations").join(id).with_extension("db");
     if !path.is_file() {
-        return Ok(HashMap::new());
+        return Ok(None);
     }
-    let root = root.canonicalize().map_err(|error| error.to_string())?;
-    let path = path.canonicalize().map_err(|error| error.to_string())?;
-    if !path.starts_with(root) {
+    if !database_stays_inside(root, &path)? {
         return Err("Conversation database is outside the Antigravity root".into());
     }
-    read_generations(&path, steps).map_err(|error| error.to_string())
+    Ok(Some(path))
 }
 
-fn read_generations(path: &Path, steps: &[u64]) -> rusqlite::Result<HashMap<u64, Generation>> {
-    let mut conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    // A busy native writer must not hold up the usage refresh. Normal SQLite reads
-    // include the WAL; immutable mode would miss live generations.
-    conn.busy_timeout(Duration::ZERO)?;
-    let tx = conn.transaction()?;
-    let mut step_query = tx.prepare("SELECT metadata FROM steps WHERE idx=?1 AND step_type=15")?;
-    let mut generation_query = tx.prepare("SELECT data FROM gen_metadata WHERE idx=?1")?;
+/// Fingerprint of the companion `conversations/<id>.db` (and its WAL file when present) so
+/// `session_log_sync` cursors stay valid across steady-state syncs while still re-importing
+/// when the native database is created or updated after the transcript.
+pub(super) fn native_state_fingerprint(transcript: &Path) -> String {
+    let Ok(Some(path)) = native_database_path(transcript) else {
+        return "none".to_string();
+    };
+    let file_sig = |target: &Path| -> (i64, u64) {
+        std::fs::metadata(target)
+            .map(|meta| {
+                (
+                    crate::services::session_usage::metadata_modified_nanos(&meta),
+                    meta.len(),
+                )
+            })
+            .unwrap_or((0, 0))
+    };
+    let (db_mtime, db_len) = file_sig(&path);
+    let mut wal_os = path.as_os_str().to_os_string();
+    wal_os.push("-wal");
+    let (wal_mtime, wal_len) = file_sig(Path::new(&wal_os));
+    format!("{db_mtime}:{db_len}:{wal_mtime}:{wal_len}")
+}
+
+pub(super) fn generations_for_transcript(
+    transcript: &Path,
+    steps: &[u64],
+) -> Result<HashMap<u64, Generation>, String> {
+    let Some(path) = native_database_path(transcript)? else {
+        return Ok(HashMap::new());
+    };
+    read_generations(&path, steps)
+}
+
+/// Canonicalize when the platform can. A WSL UNC path often cannot, so compare the
+/// `\\wsl.localhost\<distro>` strings instead of refusing to read the database.
+fn database_stays_inside(root: &Path, path: &Path) -> Result<bool, String> {
+    if let (Ok(root), Ok(path)) = (root.canonicalize(), path.canonicalize()) {
+        return Ok(path.starts_with(root));
+    }
+    match (
+        crate::config::wsl_unc_to_linux(&root.to_string_lossy()),
+        crate::config::wsl_unc_to_linux(&path.to_string_lossy()),
+    ) {
+        (Some((root_distro, root_linux)), Some((path_distro, path_linux))) => Ok(root_distro
+            .eq_ignore_ascii_case(&path_distro)
+            && (path_linux == root_linux || path_linux.starts_with(&format!("{root_linux}/")))),
+        _ => Err(format!(
+            "cannot confirm {} stays inside {}",
+            path.display(),
+            root.display()
+        )),
+    }
+}
+
+fn read_generations(path: &Path, steps: &[u64]) -> Result<HashMap<u64, Generation>, String> {
+    let db = crate::agy_sqlite::open_read_only(path)?;
+    // A busy native writer must not hold up the usage refresh. The direct open keeps
+    // a zero timeout; a WSL snapshot is a private copy and uses its own timeout.
+    // Immutable mode would miss live generations, so the WAL is included.
+    let conn = db.conn();
+    let mut step_query = conn
+        .prepare("SELECT metadata FROM steps WHERE idx=?1 AND step_type=15")
+        .map_err(|err| err.to_string())?;
+    let mut generation_query = conn
+        .prepare("SELECT data FROM gen_metadata WHERE idx=?1")
+        .map_err(|err| err.to_string())?;
     let mut generations = HashMap::new();
     for &step in steps {
         let Ok(index) = i64::try_from(step) else {
@@ -150,7 +203,8 @@ fn read_generations(path: &Path, steps: &[u64]) -> rusqlite::Result<HashMap<u64,
         };
         let metadata: Option<Vec<u8>> = step_query
             .query_row([index], |row| row.get(0))
-            .optional()?
+            .optional()
+            .map_err(|err| err.to_string())?
             .flatten();
         let Some(reference) = metadata
             .and_then(|bytes| StepMetadata::decode(bytes.as_slice()).ok())
@@ -163,7 +217,8 @@ fn read_generations(path: &Path, steps: &[u64]) -> rusqlite::Result<HashMap<u64,
         };
         let data: Option<Vec<u8>> = generation_query
             .query_row([generation], |row| row.get(0))
-            .optional()?;
+            .optional()
+            .map_err(|err| err.to_string())?;
         let Some(bytes) = data else {
             continue;
         };
@@ -175,7 +230,24 @@ fn read_generations(path: &Path, steps: &[u64]) -> rusqlite::Result<HashMap<u64,
             .ok()
             .and_then(|metadata| metadata.response)
             .map(|response| response.model);
-        let model = [tiered, base]
+        // Orchestrator's display field names the mode (or just "Gemini Flash"),
+        // while field 19 identifies the planner/worker that produced this step.
+        // Only these exact AGY aliases are mapped; unknown IDs keep their configured pricing.
+        // https://antigravity.google/docs/models#orchestrator
+        let orchestrator_model = match base.as_deref() {
+            Some("gemini-pro-orchestrator") => Some("gemini-4-carbon"),
+            Some("gemini-pro-orchestrator-argon") => Some("gemini-4-argon"),
+            Some("gemini-flash-worker-agy") => Some("gemini-4-hydrogen"),
+            _ => None,
+        };
+        let tiered = tiered.filter(|model| {
+            let id = super::model_id_of(model);
+            // Keep a concrete field-21 model/tier if a newer AGY build supplies one.
+            !(orchestrator_model.is_some()
+                && (super::is_orchestrator(&id)
+                    || matches!(id.as_str(), "gemini-flash" | "gemini-flash-worker-agy")))
+        });
+        let model = [tiered, orchestrator_model.map(str::to_string), base]
             .into_iter()
             .flatten()
             .map(|model| model.trim().to_string())
@@ -189,7 +261,7 @@ fn read_generations(path: &Path, steps: &[u64]) -> rusqlite::Result<HashMap<u64,
 }
 
 #[cfg(test)]
-fn read_models(path: &Path, steps: &[u64]) -> rusqlite::Result<HashMap<u64, String>> {
+fn read_models(path: &Path, steps: &[u64]) -> Result<HashMap<u64, String>, String> {
     Ok(read_generations(path, steps)?
         .into_iter()
         .filter_map(|(step, generation)| Some((step, generation.model?)))
@@ -265,6 +337,56 @@ pub(super) fn test_timing(first_token_ms: i64, streaming_ms: i64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn orchestrator_native_aliases_use_generation_role_instead_of_generic_display() {
+        if crate::config::sqlite_unsupported_in_temp_dir() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.db");
+        let conn = write_test_database(
+            &path,
+            &[
+                (1, 0, "gemini-pro-orchestrator"),
+                (3, 7, "gemini-flash-worker-agy"),
+                (5, 2, "gemini-pro-orchestrator-argon"),
+                (7, 3, "future-worker"),
+                (9, 4, "gemini-flash-worker-agy"),
+            ],
+        );
+        set_test_generation(
+            &conn,
+            0,
+            "gemini-pro-orchestrator",
+            &test_model_id("Orchestrator (Carbon)"),
+        );
+        set_test_generation(
+            &conn,
+            7,
+            "gemini-flash-worker-agy",
+            &test_model_id("Gemini Flash"),
+        );
+        set_test_generation(
+            &conn,
+            2,
+            "gemini-pro-orchestrator-argon",
+            &test_model_id("Orchestrator (Argon)"),
+        );
+        set_test_generation(
+            &conn,
+            4,
+            "gemini-flash-worker-agy",
+            &test_model_id("gemini-4-hydrogen-high"),
+        );
+        let models = read_models(&path, &[1, 3, 5, 7, 9]).unwrap();
+        assert_eq!(models[&1], "gemini-4-carbon");
+        assert_eq!(models[&3], "gemini-4-hydrogen");
+        assert_eq!(models[&5], "gemini-4-argon");
+        assert_eq!(models[&7], "future-worker");
+        assert_eq!(models[&9], "gemini-4-hydrogen-high");
+    }
 
     #[test]
     fn uses_step_references_including_zero_instead_of_generation_order() {

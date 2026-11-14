@@ -74,6 +74,8 @@ describe("useDirectorySettings", () => {
       if (app === "openclaw") return "/remote/openclaw";
       if (app === "pi") return "/remote/pi";
       if (app === "omp") return "/remote/omp";
+      if (app === "dsh") return "/remote/dsh";
+      if (app === "agy") return "/remote/agy";
       return "/remote/hermes";
     });
     selectConfigDirectoryMock.mockReset();
@@ -100,6 +102,8 @@ describe("useDirectorySettings", () => {
       hermes: "/remote/hermes",
       pi: "/remote/pi",
       omp: "/remote/omp",
+      dsh: "/remote/dsh",
+      agy: "/remote/agy",
     });
   });
 
@@ -112,6 +116,8 @@ describe("useDirectorySettings", () => {
     ["openclaw", "openclawConfigDir"],
     ["hermes", "hermesConfigDir"],
     ["pi", "piConfigDir"],
+    ["dsh", "dshConfigDir"],
+    ["agy", "agyConfigDir"],
   ] as const)(
     "syncs the %s display when form drafts are discarded",
     async (app, field) => {

@@ -13,7 +13,10 @@ use std::sync::Arc;
 use tauri::AppHandle;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
+use tool_lifecycle_progress::ToolLifecycleProgress;
 
+#[path = "tool_lifecycle_progress.rs"]
+mod tool_lifecycle_progress;
 #[path = "tool_node_requirement.rs"]
 mod tool_node_requirement;
 #[path = "tool_uninstall.rs"]
@@ -73,7 +76,6 @@ pub async fn copy_text_to_clipboard(text: String) -> Result<bool, String> {
     .map_err(|e| format!("剪贴板任务执行失败: {e}"))?
 }
 
-/// 检查更新
 #[tauri::command]
 pub async fn check_for_updates(handle: AppHandle) -> Result<bool, String> {
     handle
@@ -124,12 +126,7 @@ pub async fn open_portable_update_download(
 /// 判断是否为便携版（绿色版）运行
 #[tauri::command]
 pub async fn is_portable_mode() -> Result<bool, String> {
-    let exe_path = std::env::current_exe().map_err(|e| format!("获取可执行路径失败: {e}"))?;
-    if let Some(dir) = exe_path.parent() {
-        Ok(dir.join("portable.ini").is_file())
-    } else {
-        Ok(false)
-    }
+    Ok(crate::app_update::is_portable())
 }
 
 /// 获取应用启动阶段的初始化错误（若有）。
@@ -170,9 +167,9 @@ pub struct ToolVersion {
     update_blocked_by_node: Option<tool_node_requirement::NodeRequirementGap>,
 }
 
-const VALID_TOOLS: [&str; 13] = [
+const VALID_TOOLS: [&str; 14] = [
     "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi", "mcode", "kimi",
-    "dsh", "agy", "omp",
+    "dsh", "agy", "omp", "copilot",
 ];
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -257,8 +254,24 @@ impl Default for ToolLifecycleCoordinator {
 }
 
 impl ToolLifecycleCoordinator {
+    #[cfg(test)]
     async fn run<F>(&self, tools: Vec<&'static str>, operation: F) -> Result<(), String>
     where
+        F: FnOnce(&[&str]) -> Result<(), String> + Send + 'static,
+    {
+        self.run_with_queue_notice(tools, || {}, operation).await
+    }
+
+    /// 按工具加锁后串行执行 `operation`；要等前一个工具的写入结束时先调用
+    /// `on_queued`，让界面显示「排队中」而不是一直转圈。
+    async fn run_with_queue_notice<Q, F>(
+        &self,
+        tools: Vec<&'static str>,
+        on_queued: Q,
+        operation: F,
+    ) -> Result<(), String>
+    where
+        Q: FnOnce(),
         F: FnOnce(&[&str]) -> Result<(), String> + Send + 'static,
     {
         let tool_guards = tools
@@ -273,7 +286,13 @@ impl ToolLifecycleCoordinator {
                     .map_err(|_| "TOOL_ACTION_IN_PROGRESS".to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let execution_guard = self.execution.clone().lock_owned().await;
+        let execution_guard = match self.execution.clone().try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                on_queued();
+                self.execution.clone().lock_owned().await
+            }
+        };
 
         // 必须把锁移进 blocking 任务：即使等待它的 IPC future 被取消，
         // 子进程仍会继续运行，直到它真正退出前都不能允许下一次写入。
@@ -332,6 +351,7 @@ pub async fn prepare_tool_uninstall(
 
 #[tauri::command]
 pub async fn run_tool_lifecycle_action(
+    app: AppHandle,
     tools: Vec<String>,
     action: String,
     wsl_shell_by_tool: Option<HashMap<String, WslShellPreferenceInput>>,
@@ -347,16 +367,23 @@ pub async fn run_tool_lifecycle_action(
         if requested.len() != 1 || requested[0] != plan.tool {
             return Err("The uninstall plan does not match the selected tool.".into());
         }
+        let progress = ToolLifecycleProgress::from_app(app, &requested);
+        let queued = progress.clone();
         return TOOL_LIFECYCLE
-            .run(requested, move |tools| {
-                for tool in tools {
-                    let pref = wsl_shell_by_tool
-                        .as_ref()
-                        .and_then(|prefs| prefs.get(*tool));
-                    tool_uninstall::uninstall(tool, pref, &plan)?;
-                }
-                Ok(())
-            })
+            .run_with_queue_notice(
+                requested,
+                move || queued.queued(),
+                move |tools| {
+                    progress.running();
+                    for tool in tools {
+                        let pref = wsl_shell_by_tool
+                            .as_ref()
+                            .and_then(|prefs| prefs.get(*tool));
+                        tool_uninstall::uninstall(tool, pref, &plan, &progress)?;
+                    }
+                    Ok(())
+                },
+            )
             .await;
     }
     let action = ToolLifecycleAction::from_str(&action)?;
@@ -372,12 +399,19 @@ pub async fn run_tool_lifecycle_action(
     };
 
     // 排队结束后再探测安装目标，与执行一起持锁，避免读到另一升级的中间状态。
+    let progress = ToolLifecycleProgress::from_app(app, &requested);
+    let queued = progress.clone();
     TOOL_LIFECYCLE
-        .run(requested, move |tools| {
-            let command_line =
-                build_tool_lifecycle_command(tools, action, wsl_shell_by_tool.as_ref())?;
-            run_tool_lifecycle_silently(&command_line, label)
-        })
+        .run_with_queue_notice(
+            requested,
+            move || queued.queued(),
+            move |tools| {
+                progress.running();
+                let command_line =
+                    build_tool_lifecycle_command(tools, action, wsl_shell_by_tool.as_ref())?;
+                run_tool_lifecycle_silently(&command_line, label, &progress)
+            },
+        )
         .await
 }
 
@@ -385,8 +419,13 @@ pub async fn run_tool_lifecycle_action(
 /// 不再弹出可见终端窗口（与 `launch_terminal_running` 的"开窗即返回"形成对比，
 /// 后者仍保留给 provider 切换等需要交互式终端的场景）。
 /// 失败时回传 stderr/stdout 末尾若干行，供前端 toast 提示。
+/// 不开终端窗口，但每行输出会经 `progress` 推给界面显示。
 #[cfg(not(target_os = "windows"))]
-fn run_tool_lifecycle_silently(command_line: &str, _label: &str) -> Result<(), String> {
+fn run_tool_lifecycle_silently(
+    command_line: &str,
+    _label: &str,
+    progress: &ToolLifecycleProgress,
+) -> Result<(), String> {
     use std::process::Command;
     // command_line 是 bash 风格脚本（含 `set -e` 与多行命令）；强制用 bash 执行，
     // 避免用户默认 shell 为 fish/zsh 时 `set -e` 等语义不一致。
@@ -399,14 +438,19 @@ fn run_tool_lifecycle_silently(command_line: &str, _label: &str) -> Result<(), S
         let inherited = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", merge_path_segments(&login_path, &inherited));
     }
-    let output = cmd.output().map_err(|e| format!("启动安装进程失败: {e}"))?;
+    let output = tool_lifecycle_progress::run_with_progress(cmd, progress)
+        .map_err(|e| format!("启动安装进程失败: {e}"))?;
     finish_lifecycle_output(&output)
 }
 
 /// Windows 静默执行：command_line 是 .bat 内容（chcp 65001 + @echo off + call/wsl 行，CRLF 分隔），
 /// 写临时 .bat 后用 `cmd /C` 执行，`CREATE_NO_WINDOW` 抑制 console 窗口。
 #[cfg(target_os = "windows")]
-fn run_tool_lifecycle_silently(command_line: &str, label: &str) -> Result<(), String> {
+fn run_tool_lifecycle_silently(
+    command_line: &str,
+    label: &str,
+    progress: &ToolLifecycleProgress,
+) -> Result<(), String> {
     // 每次调用使用独立目录，避免同进程并发升级时覆盖或删除另一工具的脚本。
     let script_dir = tempfile::Builder::new()
         .prefix("cc_switch_lifecycle_")
@@ -415,7 +459,10 @@ fn run_tool_lifecycle_silently(command_line: &str, label: &str) -> Result<(), St
     let bat_file = script_dir.path().join(format!("{label}.bat"));
     std::fs::write(&bat_file, command_line).map_err(|e| format!("写入批处理文件失败: {e}"))?;
 
-    let output = windows_lifecycle_command(&bat_file, &effective_path_string()).output();
+    let output = tool_lifecycle_progress::run_with_progress(
+        windows_lifecycle_command(&bat_file, &effective_path_string()),
+        progress,
+    );
 
     finish_lifecycle_output(&output.map_err(|e| format!("启动安装进程失败: {e}"))?)
 }
@@ -446,7 +493,7 @@ fn finish_lifecycle_output(output: &std::process::Output) -> Result<(), String> 
     } else {
         stderr.trim()
     };
-    let detail = last_lines(raw, 8);
+    let detail = npm_bin_collision_detail(raw).unwrap_or_else(|| last_lines(raw, 8));
     Err(if detail.is_empty() {
         format!("命令执行失败 (exit code: {:?})", output.status.code())
     } else {
@@ -483,6 +530,15 @@ fn npm_bin_collision_path(raw: &str) -> Option<&str> {
             .map(|(_, path)| path.trim())
             .filter(|path| !path.is_empty())
     })
+}
+
+/// npm 链接可执行文件撞上不归它管的同名文件时以 EEXIST 退出（#9173）。关键的两行
+/// 可能被尾部的 `--force` 建议、更新通知和日志路径挤出最后 8 行，这里单独保留，
+/// 前端据此换成可操作的提示。
+fn npm_bin_collision_detail(text: &str) -> Option<String> {
+    let code = text.lines().find(|line| line.contains("EEXIST"))?;
+    let exists = text.lines().find(|line| line.contains("File exists:"))?;
+    Some(format!("{}\n{}", code.trim(), exists.trim()))
 }
 
 /// 取文本末尾最多 `n` 行（npm / pip 的关键错误通常出现在输出尾部）。
@@ -662,6 +718,7 @@ fn tool_display_name(tool: &str) -> &'static str {
         "kimi" => "Kimi Code",
         "dsh" => "DeepSeek Harness",
         "agy" => "Antigravity CLI",
+        "copilot" => "GitHub Copilot CLI",
         _ => "Unknown",
     }
 }
@@ -950,6 +1007,7 @@ fn npm_install_command_for(tool: &str) -> Option<&'static str> {
         "openclaw" => Some("npm i -g openclaw@latest"),
         "pi" => Some("npm i -g @earendil-works/pi-coding-agent@latest"),
         "kimi" => Some("npm i -g @moonshot-ai/kimi-code@latest"),
+        "copilot" => Some("npm i -g @github/copilot@latest"),
         "dsh" => Some("npm i -g @deepseek-ai/dsh@latest --engine-strict"),
         "mcode" => Some(
             "npm i -g @minimax-ai/code@latest --ignore-scripts=false --include=optional \"--allow-scripts=@minimax-ai/code,better-sqlite3\"",
@@ -1128,7 +1186,7 @@ fn tool_action_shell_command(tool: &str, action: ToolLifecycleAction) -> Option<
 /// 出的版本会包含 Windows batch 语义(例如 `|| call npm ...`)且 hermes 会返回
 /// Windows PowerShell installer,但跨 `wsl.exe` 边界后跑的是 Linux。这个 wrapper
 /// 强制生成 POSIX 版命令。
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn wsl_tool_action_shell_command(tool: &str, action: ToolLifecycleAction) -> Option<String> {
     match action {
         ToolLifecycleAction::Install => {
@@ -1220,7 +1278,7 @@ fn build_tool_action_line(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn build_wsl_tool_action_line(
     distro: &str,
     command: &str,
@@ -1258,12 +1316,12 @@ fn build_wsl_tool_action_line(
 /// `win_quote_path_for_batch`(给锚定路径用)都基于它,避免两份 quoter 各自演化、
 /// 未来对同一路径产生不一致引用形态。镜像 POSIX 侧 `shell_single_quote` 与
 /// `quote_path_if_spaced` 的"重量基础 + 轻量条件包装"两层结构。
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn win_double_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn windows_cmd_double_quote_arg(value: &str) -> String {
     win_double_quote(value)
 }
@@ -1375,6 +1433,7 @@ async fn get_single_tool_version_impl(
         "dsh" => fetch_npm_latest_for_tool(&client, "@deepseek-ai/dsh", tool, local).await,
         "agy" => fetch_agy_latest_version(&client).await,
         "omp" => fetch_npm_latest_for_tool(&client, "@oh-my-pi/pi-coding-agent", tool, local).await,
+        "copilot" => fetch_npm_latest_for_tool(&client, "@github/copilot", tool, local).await,
         _ => None,
     };
 
@@ -1867,7 +1926,7 @@ fn try_get_version(tool: &str) -> ShellProbe {
 
 /// 校验 WSL 发行版名称是否合法
 /// WSL 发行版名称只允许字母、数字、连字符、下划线和点（如 `Ubuntu-22.04`）
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn is_valid_wsl_distro_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -1885,7 +1944,7 @@ fn is_valid_shell(shell: &str) -> bool {
 }
 
 /// Validate that the given shell flag is one of the allowed flags.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn is_valid_shell_flag(flag: &str) -> bool {
     matches!(flag, "-c" | "-lc" | "-lic")
 }
@@ -2012,6 +2071,27 @@ fn build_final_shell_cd_command(shell: &str, cwd: Option<&Path>) -> String {
     .unwrap_or_default()
 }
 
+/// 未指定 shell 时的版本探测命令（外层 `sh -c` 里按登录 shell 重试）。
+#[cfg(any(target_os = "windows", test))]
+fn wsl_version_probe_shell_command(tool: &str, flag: Option<&str>) -> String {
+    wsl_auto_shell_command(&version_probe_payload(tool), flag)
+}
+
+/// `wsl.exe -d <distro> -- sh -c ... agy --version`（或别的工具）。和
+/// [`try_get_version_wsl`] 未指定 shell 时实际执行的参数一致。
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn wsl_version_probe_command_line(tool: &str, distro: &str) -> Result<String, String> {
+    if !is_valid_wsl_distro_name(distro) {
+        return Err(format!("Invalid WSL distro name: {distro}"));
+    }
+    let cmd = wsl_version_probe_shell_command(tool, None);
+    Ok(format!(
+        "wsl.exe -d {distro} -- sh -c {}",
+        windows_cmd_double_quote_arg(&cmd)
+    ))
+}
+
 #[cfg(target_os = "windows")]
 fn try_get_version_wsl(
     tool: &str,
@@ -2052,7 +2132,7 @@ fn try_get_version_wsl(
                 return ShellProbe::NotFound(format!("[WSL:{distro}] invalid shell flag: {flag}"));
             }
         }
-        let cmd = wsl_auto_shell_command(&version_probe_payload(tool), force_shell_flag);
+        let cmd = wsl_version_probe_shell_command(tool, force_shell_flag);
 
         ("sh".to_string(), "-c", cmd)
     };
@@ -2104,9 +2184,8 @@ fn try_get_version_wsl(
     }
 }
 
-/// 非 Windows 平台的 WSL 版本检测存根
-/// 注意：此函数实际上不会被调用，因为 `wsl_distro_from_path` 在非 Windows 平台总是返回 None。
-/// 保留此函数是为了保持 API 一致性，防止未来重构时遗漏。
+/// 非 Windows 平台的 WSL 版本检测存根。
+/// 配置目录解析在这些平台上不会得到 WSL 发行版，正常探测走不到这里。
 #[cfg(not(target_os = "windows"))]
 fn try_get_version_wsl(
     _tool: &str,
@@ -2858,12 +2937,46 @@ fn windows_runnable_sibling_for_extensionless_tool(path: &Path) -> Option<std::p
         .find(|candidate| candidate.is_file())
 }
 
+/// Pi ships only through npm, but PyPI has an unrelated Python 2 package also named
+/// `pi` whose console script lands in a Python `Scripts` dir as `pi.exe`. That file is
+/// never the Pi coding agent: probing it reports a Python traceback as "installed but
+/// broken", and uninstall would target it (#9267). Only pip's own layout is matched
+/// (`<tool>.exe` directly inside a `Scripts` dir); npm writes `.cmd` shims, so a custom
+/// npm prefix under some `Scripts` folder is left alone.
+#[cfg(any(target_os = "windows", test))]
+fn is_foreign_pip_launcher(tool: &str, path: &Path) -> bool {
+    tool == "pi"
+        && path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+            .ends_with(&format!("/scripts/{tool}.exe"))
+}
+
+/// VS Code's `bin\copilot-shim\copilot.exe` is a placeholder that only prints
+/// "GitHub Copilot CLI was not found" when the real CLI is missing. It sits on PATH under
+/// the tool's own name but is never the CLI, so probing it reports "installed but broken"
+/// instead of "not installed". Matched by its directory, which covers `.exe` and `.cmd`.
+#[cfg(any(target_os = "windows", test))]
+fn is_vscode_copilot_shim(tool: &str, path: &Path) -> bool {
+    tool == "copilot"
+        && path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+            .contains("/copilot-shim/")
+}
+
 /// OpenCode Desktop has shipped both root-level and Electron `resources/` CLI sidecars.
 /// Some Electron releases omitted the sidecar; `resources/app.asar` still identifies the
 /// Desktop bundle, so skip its GUI instead of probing `opencode.exe` with `--version`.
 /// A standalone OpenCode CLI install remains valid when no Desktop marker is present.
+/// Also skips launchers that only share the tool's name (`is_foreign_pip_launcher`).
 #[cfg(target_os = "windows")]
 fn windows_preferred_tool_executable(tool: &str, path: &Path) -> Option<std::path::PathBuf> {
+    if is_foreign_pip_launcher(tool, path) || is_vscode_copilot_shim(tool, path) {
+        return None;
+    }
     if tool == "opencode"
         && path
             .file_name()
@@ -3520,6 +3633,7 @@ fn npm_package_for(tool: &str) -> Option<&'static str> {
         "mcode" => Some("@minimax-ai/code"),
         "kimi" => Some("@moonshot-ai/kimi-code"),
         "omp" => Some("@oh-my-pi/pi-coding-agent"),
+        "copilot" => Some("@github/copilot"),
         "dsh" => Some("@deepseek-ai/dsh"),
         _ => None,
     }
@@ -5159,20 +5273,34 @@ pub(crate) fn tool_runs_in_wsl(tool: &str) -> bool {
 
 #[cfg(target_os = "windows")]
 fn wsl_distro_for_tool(tool: &str) -> Option<String> {
-    let override_dir = match tool {
-        "claude" => crate::settings::get_claude_override_dir(),
-        "codex" => crate::settings::get_codex_override_dir(),
-        "gemini" => crate::settings::get_gemini_override_dir(),
-        "grok" => crate::settings::get_grok_override_dir(),
-        "opencode" => crate::settings::get_opencode_override_dir(),
-        "openclaw" => crate::settings::get_openclaw_override_dir(),
-        "hermes" => crate::settings::get_hermes_override_dir(),
-        "pi" => crate::settings::get_pi_override_dir(),
-        "omp" => crate::settings::get_omp_override_dir(),
+    let settings = crate::settings::get_settings();
+    let raw = match tool {
+        "claude" => settings.claude_config_dir.as_deref(),
+        "codex" => settings.codex_config_dir.as_deref(),
+        "gemini" => settings.gemini_config_dir.as_deref(),
+        "grok" => settings.grok_config_dir.as_deref(),
+        "opencode" => settings.opencode_config_dir.as_deref(),
+        "openclaw" => settings.openclaw_config_dir.as_deref(),
+        "hermes" => settings.hermes_config_dir.as_deref(),
+        "pi" => settings.pi_config_dir.as_deref(),
+        "omp" => settings.omp_config_dir.as_deref(),
+        "dsh" => settings.dsh_config_dir.as_deref(),
+        "agy" => settings.agy_config_dir.as_deref(),
         _ => None,
     }?;
+    wsl_distro_for_override(tool, raw)
+}
 
-    wsl_distro_from_path(&override_dir)
+/// 配置目录是 WSL UNC 时返回发行版名。`tool` 必须是带目录覆盖的应用，否则即使用 UNC 也不认。
+#[cfg(any(target_os = "windows", test))]
+fn wsl_distro_for_override(tool: &str, raw: &str) -> Option<String> {
+    match tool {
+        "claude" | "codex" | "gemini" | "grok" | "opencode" | "openclaw" | "hermes" | "pi"
+        | "omp" | "dsh" | "agy" => {}
+        _ => return None,
+    }
+    let (distro, _) = crate::config::wsl_unc_to_linux(raw)?;
+    is_valid_wsl_distro_name(&distro).then_some(distro)
 }
 
 /// `hermes dashboard` 的启动命令行（交给 `launch_terminal_running`）。
@@ -5205,40 +5333,16 @@ fn wsl_hermes_dashboard_line(distro: &str) -> Result<String, String> {
     ))
 }
 
-/// 从 UNC 路径中提取 WSL 发行版名称
-/// 支持 `\\wsl$\Ubuntu\...` 和 `\\wsl.localhost\Ubuntu\...` 两种格式
-#[cfg(target_os = "windows")]
-fn wsl_distro_from_path(path: &Path) -> Option<String> {
-    use std::path::{Component, Prefix};
-    let Some(Component::Prefix(prefix)) = path.components().next() else {
-        return None;
-    };
-    match prefix.kind() {
-        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
-            let server_name = server.to_string_lossy();
-            if server_name.eq_ignore_ascii_case("wsl$")
-                || server_name.eq_ignore_ascii_case("wsl.localhost")
-            {
-                let distro = share.to_string_lossy().to_string();
-                if !distro.is_empty() {
-                    return Some(distro);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
 /// 打开指定提供商的终端
 ///
 /// 根据提供商配置的环境变量启动一个带有该提供商特定设置的终端
 /// 无需检查是否为当前激活的提供商，任何提供商都可以打开终端
-#[allow(non_snake_case)]
+#[allow(non_snake_case, clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn open_provider_terminal(
     state: State<'_, crate::store::AppState>,
     agy_accounts: State<'_, crate::commands::AgyAccountState>,
+    copilot_auth: State<'_, crate::commands::CopilotAuthState>,
     app: String,
     #[allow(non_snake_case)] providerId: String,
     cwd: Option<String>,
@@ -5263,7 +5367,12 @@ pub async fn open_provider_terminal(
             switch_agy_to_bound_account(&agy_accounts.0, provider).await?;
             agy_terminal_launch(provider)?
         }
+        AppType::Copilot => {
+            let account = copilot_bound_account(&copilot_auth, provider).await?;
+            copilot_terminal_launch(provider, account)?
+        }
         AppType::Codex => codex_terminal_launch(state.db.as_ref(), provider)?,
+        AppType::GrokBuild => grok_terminal_launch(state.db.as_ref(), provider)?,
         AppType::Claude => {
             use crate::services::provider::claude_official::{terminal_account, AccountTerminal};
             match terminal_account(provider).map_err(|e| e.to_string())? {
@@ -5418,9 +5527,12 @@ struct ProviderLaunch {
 impl ProviderLaunch {
     /// 用户在「打开终端」里勾了跳过权限确认：只加给这一次启动，不写进任何配置。
     fn skip_permissions(&mut self) {
-        // Claude Code 和 agy 的参数同名；Codex 跳过确认的同时也关掉沙箱。
+        // Claude Code 和 agy 的参数同名；Codex 跳过确认的同时也关掉沙箱；Grok Build 用自己的；
+        // Copilot CLI 的 `--allow-all` 放开工具、路径和 URL 三类确认。
         let flag = match self.program {
             "codex" => "--dangerously-bypass-approvals-and-sandbox",
+            "grok" => "--always-approve",
+            "copilot" => "--allow-all",
             _ => "--dangerously-skip-permissions",
         };
         self.args.push(flag.to_string());
@@ -5610,6 +5722,53 @@ fn codex_launch(
     })
 }
 
+/// Grok Build：直接跑 `grok`，读的就是 live 的 `config.toml`，所以只能打开当前供应商。
+///
+/// Grok CLI 没有只对一个进程换配置的办法：没有 `-c` 之类的覆盖参数，`GROK_CONFIG_PATH`
+/// 不生效（1.0.70 实测），`GROK_HOME` 会把会话、登录、技能一起换到别的目录。
+/// `GROK_HOME` 定到 CC Switch 管的目录（设置里可以改），Grok 读的就是这里写的那份。
+fn grok_terminal_launch(
+    db: &crate::database::Database,
+    provider: &crate::provider::Provider,
+) -> Result<ProviderLaunch, String> {
+    use crate::mode::current::{self, Purpose};
+    let in_use = current::provider_for(db, &AppType::GrokBuild, Purpose::InUse)
+        .map_err(|e| e.to_string())?;
+    if in_use.as_deref() != Some(provider.id.as_str()) {
+        return Err(crate::error::AppError::localized(
+            "grokbuild.terminal.not_current",
+            format!(
+                "Grok Build 不能只对一个终端换供应商：请先切换到「{}」，再打开终端",
+                provider.name
+            ),
+            format!(
+                "Grok Build can't use a different provider in a single terminal. Switch to \"{}\" first, then open the terminal",
+                provider.name
+            ),
+        )
+        .to_string());
+    }
+    Ok(grok_launch(
+        crate::grok_config::get_grok_config_dir()
+            .to_string_lossy()
+            .into_owned(),
+    ))
+}
+
+fn grok_launch(grok_home: String) -> ProviderLaunch {
+    ProviderLaunch {
+        title: "Starting Grok Build with its current config",
+        detail: None,
+        program: "grok",
+        args: Vec::new(),
+        // npm 装的是 grok.cmd：不加 `call` 跑完不回到启动 .bat，后面的清理就不执行了。
+        batch_command: "call grok".to_string(),
+        env: vec![("GROK_HOME", Some(grok_home))],
+        batch_vars: Vec::new(),
+        cleanup: Vec::new(),
+    }
+}
+
 /// Claude Code：把卡上的 env 和 `/model` 菜单写进临时 settings 文件，
 /// `claude --settings <文件>` 启动。`drops` 是切到这张卡时会从 live 清掉的键，在临时文件里
 /// 挡住（见 [`write_claude_config`]）。
@@ -5729,26 +5888,35 @@ async fn switch_agy_to_bound_account(
 fn agy_terminal_launch(provider: &crate::provider::Provider) -> Result<ProviderLaunch, String> {
     let launch = crate::services::provider::agy_direct::terminal_launch(provider)
         .map_err(|e| e.to_string())?;
-    let Some(dir) = launch.gemini_dir else {
-        let (args, batch_command, batch_vars) = match launch.model {
-            Some(model) => (
-                vec![format!("--model={model}")],
-                format!("agy \"--model=%{AGY_MODEL_BATCH_VAR}%\""),
-                vec![(AGY_MODEL_BATCH_VAR, model)],
-            ),
-            None => (Vec::new(), "agy".to_string(), Vec::new()),
-        };
+    if !launch.key_mode {
+        let mut args = Vec::new();
+        let mut batch_parts = vec!["agy".to_string()];
+        let mut batch_vars = Vec::new();
+        if let Some(dir) = launch.gemini_dir {
+            let raw = dir.to_string_lossy().into_owned();
+            args.push(format!("--gemini_dir={raw}"));
+            batch_parts.push(format!("\"--gemini_dir=%{AGY_DIR_BATCH_VAR}%\""));
+            batch_vars.push((AGY_DIR_BATCH_VAR, raw));
+        }
+        if let Some(model) = launch.model {
+            args.push(format!("--model={model}"));
+            batch_parts.push(format!("\"--model=%{AGY_MODEL_BATCH_VAR}%\""));
+            batch_vars.push((AGY_MODEL_BATCH_VAR, model));
+        }
         return Ok(ProviderLaunch {
             title: "Starting Antigravity CLI with your signed-in account",
             detail: None,
             program: "agy",
             args,
-            batch_command,
+            batch_command: batch_parts.join(" "),
             env: launch.env,
             batch_vars,
             cleanup: Vec::new(),
         });
-    };
+    }
+    let dir = launch
+        .gemini_dir
+        .ok_or_else(|| "Antigravity API-key launch missing private directory".to_string())?;
     Ok(ProviderLaunch {
         title: "Using a private Antigravity profile for this provider:",
         detail: Some(dir.clone()),
@@ -5782,6 +5950,118 @@ pub(crate) fn open_agy_resume_terminal(
     let cwd = resolve_launch_cwd(cwd)?;
     launch_provider_terminal(&launch, cwd.as_deref()).map_err(|e| format!("启动终端失败: {e}"))
 }
+
+/// 官方卡绑定的授权中心 GitHub 账号的 Token 和域名；没绑时为 `None`，跟着 Copilot CLI 自己的登录走。
+async fn copilot_bound_account(
+    auth: &crate::commands::CopilotAuthState,
+    provider: &crate::provider::Provider,
+) -> Result<Option<(String, String)>, String> {
+    let Some(account_id) = crate::services::provider::copilot_direct::bound_account_id(provider)
+    else {
+        return Ok(None);
+    };
+    let credentials = auth
+        .0
+        .read()
+        .await
+        .github_credentials_for_account(&account_id)
+        .await;
+    match credentials {
+        Some(credentials) => Ok(Some(credentials)),
+        None => Err(crate::error::AppError::localized(
+            "copilot.account.bound_missing",
+            format!(
+                "「{}」绑定的 GitHub 账号不在授权中心里：请先在授权中心添加它，或编辑这张卡改选账号",
+                provider.name
+            ),
+            format!(
+                "The GitHub account bound to \"{}\" is not in the Auth Center. Add it there, or edit the card to choose another account.",
+                provider.name
+            ),
+        )
+        .to_string()),
+    }
+}
+
+/// GitHub Copilot CLI：官方卡跑 `copilot`，卡上设了模型就加 `--model`；绑了授权中心账号时
+/// 经 `COPILOT_GITHUB_TOKEN` 只给这一个进程。自带模型卡要先添加进 providers.json，启动时
+/// `--model=<卡片 id>/<第一个模型>`，并清掉所有 `COPILOT_PROVIDER_*`（有它们 Copilot 就不读
+/// providers.json）。
+fn copilot_terminal_launch(
+    provider: &crate::provider::Provider,
+    account: Option<(String, String)>,
+) -> Result<ProviderLaunch, String> {
+    let launch = crate::services::provider::copilot_direct::terminal_launch(provider)
+        .map_err(|e| e.to_string())?;
+    copilot_launch_command(&provider.name, launch, account)
+}
+
+fn copilot_launch_command(
+    provider_name: &str,
+    launch: crate::copilot_config::CopilotLaunch,
+    account: Option<(String, String)>,
+) -> Result<ProviderLaunch, String> {
+    let mut env = launch.env;
+    if !launch.byok {
+        if let Some((token, domain)) = account {
+            env.push(("COPILOT_GITHUB_TOKEN", Some(token)));
+            env.push(("COPILOT_GH_HOST", Some(domain)));
+        }
+    }
+    // npm 装的是 copilot.cmd：不加 `call` 跑完不回到启动 .bat，后面删临时文件（含 Key、
+    // GitHub 令牌的 .bat 本身）的几行就不执行了。`call` 会把 `%` 再展开一遍、把引号里的 `^`
+    // 加倍，cmd 也不认 `\"`，所以模型名里有这些字符时不在 Windows 上启动。
+    // 模型名会拼进启动命令：控制字符（换行）在任何平台都拒绝，保存时已经校验过，这里兜底。
+    if launch
+        .model
+        .as_deref()
+        .is_some_and(|model| model.chars().any(char::is_control))
+    {
+        return Err(format!(
+            "「{provider_name}」的模型名里有换行等控制字符，不能用来启动"
+        ));
+    }
+    if cfg!(target_os = "windows")
+        && launch
+            .model
+            .as_deref()
+            .is_some_and(|model| model.contains(['"', '%', '^']))
+    {
+        return Err(format!(
+            "「{provider_name}」的模型名里有 Windows 终端传不过去的字符（\" % ^）"
+        ));
+    }
+    let (mut args, mut batch_command, batch_vars) = match launch.model {
+        Some(model) => (
+            vec![format!("--model={model}")],
+            format!("call copilot \"--model=%{COPILOT_MODEL_BATCH_VAR}%\""),
+            vec![(COPILOT_MODEL_BATCH_VAR, model)],
+        ),
+        None => (Vec::new(), "call copilot".to_string(), Vec::new()),
+    };
+    // 只会是 copilot_config::REASONING_EFFORTS 里的小写单词（已校验），可以直接写进命令。
+    if let Some(effort) = launch.reasoning_effort {
+        args.push(format!("--reasoning-effort={effort}"));
+        batch_command.push_str(&format!(" --reasoning-effort={effort}"));
+    }
+    Ok(ProviderLaunch {
+        title: if launch.byok {
+            "Starting GitHub Copilot CLI with this provider's model"
+        } else {
+            "Starting GitHub Copilot CLI with your GitHub sign-in"
+        },
+        detail: None,
+        program: "copilot",
+        args,
+        batch_command,
+        env,
+        batch_vars,
+        cleanup: Vec::new(),
+    })
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const COPILOT_MODEL_BATCH_VAR: &str = "CC_SWITCH_COPILOT_MODEL";
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const AGY_DIR_BATCH_VAR: &str = "CC_SWITCH_AGY_DIR";
@@ -6477,19 +6757,339 @@ fn which_command(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 交给发行版登录 shell 的 `-lic` 参数。`~/.local/bin` 这类写在 rc 里的目录才找得到 agy。
+#[cfg(any(target_os = "windows", test))]
+fn wsl_login_inner(payload: &str) -> String {
+    format!("\"${{SHELL:-sh}}\" -lic {}", shell_single_quote(payload))
+}
+
+/// 在发行版的登录 shell 里跑一段命令。
+#[cfg(any(target_os = "windows", test))]
+fn wsl_login_command_line(distro: &str, payload: &str) -> Result<String, String> {
+    if !is_valid_wsl_distro_name(distro) {
+        return Err(format!("Invalid WSL distro name: {distro}"));
+    }
+    Ok(format!(
+        "wsl.exe -d {distro} -- sh -c {}",
+        windows_cmd_double_quote_arg(&wsl_login_inner(payload))
+    ))
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WslTerminalCommand {
+    line: String,
+    set_lines: String,
+    env: Vec<(String, String)>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Default)]
+struct WslEnvCarrier {
+    entries: Vec<(String, String)>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl WslEnvCarrier {
+    fn var_for(&mut self, value: &str) -> String {
+        if let Some((name, _)) = self.entries.iter().find(|(_, existing)| existing == value) {
+            return name.clone();
+        }
+        let name = format!("CC_SWITCH_INTERNAL_WSL_{}", self.entries.len());
+        self.entries.push((name.clone(), value.to_string()));
+        name
+    }
+
+    fn shell_arg(&mut self, value: &str) -> String {
+        if value.is_ascii() {
+            shell_single_quote(value)
+        } else {
+            format!("\"${}\"", self.var_for(value))
+        }
+    }
+
+    fn shell_word_or_env(&mut self, value: &str) -> String {
+        if value.is_ascii() {
+            shell_word(value)
+        } else {
+            format!("\"${}\"", self.var_for(value))
+        }
+    }
+
+    fn joined_subdir(&mut self, base: &str, suffix: &str) -> String {
+        if base.is_ascii() && suffix.is_ascii() {
+            shell_single_quote(&format!("{base}{suffix}"))
+        } else {
+            format!("\"${}\"{suffix}", self.var_for(base))
+        }
+    }
+
+    fn wslenv_set_lines(&self) -> String {
+        if self.entries.is_empty() {
+            return String::new();
+        }
+        let spec: String = self
+            .entries
+            .iter()
+            .map(|(name, _)| format!("{name}/u"))
+            .collect::<Vec<_>>()
+            .join(":");
+        format!(
+            "if defined WSLENV set \"WSLENV=%WSLENV%:{spec}\"\r\nif not defined WSLENV set \"WSLENV={spec}\"\r\n"
+        )
+    }
+}
+
+/// 打开终端时给 agy 的那段 Linux 命令（还没包 `wsl.exe`）。
+/// `gemini_root` 是覆盖目录（`.gemini`）。没有 `--gemini_dir` 时补上它的 Linux 路径，
+/// 这样发行版里的 agy 用的就是这块配置，而不是默认家目录。已有 `--gemini_dir`（Key 卡的
+/// 私有目录或官方卡的覆盖根）时改成发行版能读的路径；仅 Key 卡私有目录与 `shared` 不同时
+/// 才把共享 `config` 链过去。非 ASCII 值经 `WSLENV` 传入，免得被 Windows 控制台代码页损坏。
+#[cfg(any(target_os = "windows", test))]
+fn agy_wsl_terminal_payload(
+    distro: &str,
+    gemini_root: &str,
+    launch: &ProviderLaunch,
+    cwd: Option<&str>,
+) -> Result<(String, WslEnvCarrier), String> {
+    let shared = crate::config::path_into_wsl(gemini_root, distro)
+        .ok_or_else(|| format!("Antigravity config directory is not inside WSL distro {distro}"))?;
+    let mut carrier = WslEnvCarrier::default();
+    let mut steps = Vec::new();
+    if let Some(cwd) = cwd.filter(|value| !value.is_empty()) {
+        let linux = crate::config::path_into_wsl(cwd, distro)
+            .ok_or_else(|| format!("Cannot use this folder inside WSL distro {distro}"))?;
+        steps.push(format!("cd {}", carrier.shell_arg(&linux)));
+    }
+    for (name, value) in &launch.env {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.is_empty() {
+            return Err(format!("invalid env for {name}"));
+        }
+        match value {
+            None => steps.push(format!("unset {name}")),
+            Some(value) => steps.push(format!("export {name}={}", carrier.shell_arg(value))),
+        }
+    }
+    let mut args = Vec::new();
+    let mut has_gemini_dir = false;
+    let mut private_dir = None;
+    for arg in &launch.args {
+        if let Some(path) = arg.strip_prefix("--gemini_dir=") {
+            has_gemini_dir = true;
+            let linux = crate::config::path_into_wsl(path, distro).ok_or_else(|| {
+                format!("Cannot use this Antigravity profile inside WSL distro {distro}")
+            })?;
+            if linux != shared {
+                private_dir = Some(linux.clone());
+            }
+            args.push(format!(
+                "--gemini_dir={}",
+                carrier.shell_word_or_env(&linux)
+            ));
+        } else {
+            args.push(carrier.shell_word_or_env(arg));
+        }
+    }
+    if let Some(private_dir) = private_dir {
+        let link = carrier.joined_subdir(&private_dir, "/config");
+        let target = carrier.joined_subdir(&shared, "/config");
+        steps.push(format!(
+            "if [ ! -e {link} ] && [ ! -L {link} ]; then ln -sfn {target} {link}; fi"
+        ));
+    } else if !has_gemini_dir {
+        args.insert(
+            0,
+            format!("--gemini_dir={}", carrier.shell_word_or_env(&shared)),
+        );
+    }
+    steps.push(format!("agy {}", args.join(" ")));
+    Ok((steps.join(" && "), carrier))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn agy_wsl_terminal_command(
+    distro: &str,
+    gemini_root: &str,
+    launch: &ProviderLaunch,
+    cwd: Option<&str>,
+) -> Result<WslTerminalCommand, String> {
+    let (payload, carrier) = agy_wsl_terminal_payload(distro, gemini_root, launch, cwd)?;
+    Ok(WslTerminalCommand {
+        line: wsl_login_command_line(distro, &payload)?,
+        set_lines: carrier.wslenv_set_lines(),
+        env: carrier.entries,
+    })
+}
+
+/// 安装 / 更新 agy 时跨进发行版的那一行（POSIX 安装脚本或 `agy update`，不是 Windows 的 ps1）。
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn agy_wsl_lifecycle_command(distro: &str, action: ToolLifecycleAction) -> Result<String, String> {
+    let inner = wsl_tool_action_shell_command("agy", action)
+        .ok_or_else(|| "Unsupported tool action target: agy".to_string())?;
+    build_wsl_tool_action_line(distro, &inner, None, None)
+}
+
+/// 在发行版里问官方登录的剩余额度。Key 环境变量清掉，免得 agy 改走 Key 模式。
+#[cfg(any(target_os = "windows", test))]
+fn agy_wsl_usage_payload(distro: &str, gemini_root: &str) -> Result<String, String> {
+    let root = crate::config::path_into_wsl(gemini_root, distro)
+        .ok_or_else(|| format!("Antigravity config directory is not inside WSL distro {distro}"))?;
+    Ok(format!(
+        "unset GEMINI_API_KEY; unset GOOGLE_GEMINI_BASE_URL; echo {}; agy --gemini_dir={} --print /usage --output-format json",
+        crate::services::subscription_agy::USAGE_OUTPUT_SENTINEL,
+        shell_word(&root)
+    ))
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn agy_wsl_usage_command(distro: &str, gemini_root: &str) -> Result<String, String> {
+    wsl_login_command_line(distro, &agy_wsl_usage_payload(distro, gemini_root)?)
+}
+
+/// `agy models`。没 Key 时用覆盖目录里的官方登录；有 Key 时用调用方准备好的私有目录。
+#[cfg(any(target_os = "windows", test))]
+fn agy_wsl_models_payload(
+    distro: &str,
+    gemini_root: &str,
+    profile_dir: Option<&str>,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<String, String> {
+    let dir = match profile_dir {
+        Some(path) => crate::config::path_into_wsl(path, distro).ok_or_else(|| {
+            format!("Cannot use this Antigravity profile inside WSL distro {distro}")
+        })?,
+        None => crate::config::path_into_wsl(gemini_root, distro).ok_or_else(|| {
+            format!("Antigravity config directory is not inside WSL distro {distro}")
+        })?,
+    };
+    let mut steps = Vec::new();
+    if let Some(key) = api_key {
+        steps.push(format!("export GEMINI_API_KEY={}", shell_single_quote(key)));
+        if let Some(url) = base_url {
+            steps.push(format!(
+                "export GOOGLE_GEMINI_BASE_URL={}",
+                shell_single_quote(url)
+            ));
+        }
+    } else {
+        steps.push("unset GEMINI_API_KEY; unset GOOGLE_GEMINI_BASE_URL".to_string());
+    }
+    steps.push(format!("agy --gemini_dir={} models", shell_word(&dir)));
+    Ok(steps.join(" && "))
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn agy_wsl_models_command(
+    distro: &str,
+    gemini_root: &str,
+    profile_dir: Option<&str>,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<String, String> {
+    wsl_login_command_line(
+        distro,
+        &agy_wsl_models_payload(distro, gemini_root, profile_dir, api_key, base_url)?,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn run_wsl_login_payload(
+    distro: &str,
+    payload: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<std::process::Output, String> {
+    use std::process::{Command, Stdio};
+
+    if !is_valid_wsl_distro_name(distro) {
+        return Err(format!("[WSL:{distro}] invalid distro name"));
+    }
+    let inner = wsl_login_inner(payload);
+    let deadline = CommandDeadline::from_timeout(timeout);
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args(["-d", distro, "--", "sh", "-c", &inner])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("[WSL:{distro}] failed to run agy: {e}"))?;
+    wait_child_output(child, deadline)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn run_agy_wsl_usage(
+    timeout: Option<std::time::Duration>,
+) -> Result<std::process::Output, String> {
+    let distro = wsl_distro_for_tool("agy")
+        .ok_or_else(|| "agy is not configured to run in WSL".to_string())?;
+    let root = crate::agy_config::agy_gemini_root();
+    let payload = agy_wsl_usage_payload(&distro, &root.to_string_lossy())?;
+    run_wsl_login_payload(&distro, &payload, timeout)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn run_agy_wsl_models(
+    profile_dir: Option<&str>,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+    timeout: Option<std::time::Duration>,
+) -> Result<std::process::Output, String> {
+    let distro = wsl_distro_for_tool("agy")
+        .ok_or_else(|| "agy is not configured to run in WSL".to_string())?;
+    let root = crate::agy_config::agy_gemini_root();
+    let payload = agy_wsl_models_payload(
+        &distro,
+        &root.to_string_lossy(),
+        profile_dir,
+        api_key,
+        base_url,
+    )?;
+    run_wsl_login_payload(&distro, &payload, timeout)
+}
+
+#[cfg(target_os = "windows")]
+fn agy_wsl_terminal_line(
+    launch: &ProviderLaunch,
+    cwd: Option<&Path>,
+) -> Result<Option<WslTerminalCommand>, String> {
+    if launch.program != "agy" {
+        return Ok(None);
+    }
+    let Some(distro) = wsl_distro_for_tool("agy") else {
+        return Ok(None);
+    };
+    let root = crate::agy_config::agy_gemini_root();
+    let cwd = cwd.map(|dir| dir.to_string_lossy().into_owned());
+    agy_wsl_terminal_command(&distro, &root.to_string_lossy(), launch, cwd.as_deref()).map(Some)
+}
+
 /// Windows: 根据用户首选终端启动
 #[cfg(target_os = "windows")]
 fn launch_windows_terminal(launch: &ProviderLaunch, cwd: Option<&Path>) -> Result<(), String> {
     let preferred = crate::settings::get_preferred_terminal();
     let terminal = preferred.as_deref().unwrap_or("cmd");
 
+    // 配置目录在 WSL 里时，bat 只负责拉起 `wsl.exe`。工作目录和 Key 都写进发行版里的
+    // 命令（非 ASCII 值经 `WSLENV` 传入）：`pushd` 到 UNC 进的是 9P 盘符。
+    let wsl_command = agy_wsl_terminal_line(launch, cwd)?;
     let bat_file = unique_temp_path("cc_switch_launcher", "bat");
-    let (cwd_command, cwd_env) = build_windows_cwd_command(cwd);
+    let (cwd_command, cwd_env) = if wsl_command.is_some() {
+        (String::new(), None)
+    } else {
+        build_windows_cwd_command(cwd)
+    };
     let mut launch_env: Vec<(String, String)> = cwd_env
         .map(|value| (WINDOWS_CWD_ENV.to_string(), value))
         .into_iter()
         .collect();
-    let (set_lines, extra_env) = build_windows_launch_env(launch);
+    let (set_lines, extra_env) = match &wsl_command {
+        Some(wsl) => (wsl.set_lines.clone(), wsl.env.clone()),
+        None => build_windows_launch_env(launch),
+    };
     launch_env.extend(extra_env);
     let launch_env: Vec<(&str, &str)> = launch_env
         .iter()
@@ -6512,7 +7112,10 @@ fn launch_windows_terminal(launch: &ProviderLaunch, cwd: Option<&Path>) -> Resul
     let content = format!(
         "@echo off\r\n{cwd_command}setlocal DisableDelayedExpansion\r\n{set_lines}echo {title}\r\n{command}\r\nendlocal\r\n{cleanup}del \"%~f0\" >nul 2>&1\r\n",
         title = escape_windows_batch_value(launch.title),
-        command = launch.batch_command,
+        command = wsl_command
+            .as_ref()
+            .map(|wsl| wsl.line.replace('%', "%%"))
+            .unwrap_or_else(|| launch.batch_command.clone()),
     );
 
     std::fs::write(&bat_file, &content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
@@ -6960,6 +7563,362 @@ pub async fn set_window_theme(window: tauri::Window, theme: String) -> Result<()
 mod tests {
 
     #[test]
+    fn agy_wsl_override_uses_the_distro_and_wsl_exe() {
+        let root = r"\\wsl.localhost\Ubuntu-26.04\home\alice\.gemini";
+        assert_eq!(
+            wsl_distro_for_override("agy", root).as_deref(),
+            Some("Ubuntu-26.04")
+        );
+        assert_eq!(
+            wsl_distro_for_override("agy", r"\\wsl$\Ubuntu-26.04\home\alice\.gemini").as_deref(),
+            Some("Ubuntu-26.04")
+        );
+        assert!(wsl_distro_for_override("agy", r"C:\Users\alice\.gemini").is_none());
+        assert!(wsl_distro_for_override(
+            "not-a-tool",
+            r"\\wsl.localhost\Ubuntu-26.04\home\alice\.gemini"
+        )
+        .is_none());
+
+        let version = wsl_version_probe_command_line("agy", "Ubuntu-26.04").unwrap();
+        assert!(
+            version.starts_with("wsl.exe -d Ubuntu-26.04 -- sh -c "),
+            "{version}"
+        );
+        assert!(version.contains("agy --version"), "{version}");
+
+        let install =
+            agy_wsl_lifecycle_command("Ubuntu-26.04", ToolLifecycleAction::Install).unwrap();
+        assert!(
+            install.starts_with("wsl.exe -d Ubuntu-26.04 -- "),
+            "{install}"
+        );
+        assert!(
+            install.contains("https://antigravity.google/cli/install.sh"),
+            "{install}"
+        );
+        assert!(
+            !install.contains("powershell") && !install.contains(".ps1"),
+            "{install}"
+        );
+
+        let update =
+            agy_wsl_lifecycle_command("Ubuntu-26.04", ToolLifecycleAction::Update).unwrap();
+        assert!(
+            update.starts_with("wsl.exe -d Ubuntu-26.04 -- "),
+            "{update}"
+        );
+        assert!(update.contains("agy update"), "{update}");
+
+        let official = ProviderLaunch {
+            title: "Starting Antigravity CLI with your signed-in account",
+            detail: None,
+            program: "agy",
+            args: vec!["--model=Gemini 3.8 Flash (High)".to_string()],
+            batch_command: "agy".to_string(),
+            env: Vec::new(),
+            batch_vars: Vec::new(),
+            cleanup: Vec::new(),
+        };
+        let terminal = agy_wsl_terminal_command(
+            "Ubuntu-26.04",
+            root,
+            &official,
+            Some(r"\\wsl.localhost\Ubuntu-26.04\home\alice\proj"),
+        )
+        .unwrap();
+        assert!(
+            terminal
+                .line
+                .starts_with("wsl.exe -d Ubuntu-26.04 -- sh -c "),
+            "{}",
+            terminal.line
+        );
+        assert!(
+            terminal.line.contains("/home/alice/proj"),
+            "{}",
+            terminal.line
+        );
+        assert!(
+            terminal
+                .line
+                .contains("agy --gemini_dir=/home/alice/.gemini"),
+            "{}",
+            terminal.line
+        );
+        assert!(
+            terminal.line.contains("--model=") && terminal.line.contains("Gemini 3.8 Flash"),
+            "{}",
+            terminal.line
+        );
+        assert!(terminal.set_lines.is_empty());
+        assert!(terminal.env.is_empty());
+
+        // 官方卡如果已经由 prepare_launch 带了与覆盖根相同的 --gemini_dir，不再重复也不自链。
+        let official_with_dir = ProviderLaunch {
+            title: "Starting Antigravity CLI with your signed-in account",
+            detail: None,
+            program: "agy",
+            args: vec![
+                format!("--gemini_dir={root}"),
+                "--model=Gemini 3.8 Flash (High)".to_string(),
+            ],
+            batch_command: "agy".to_string(),
+            env: Vec::new(),
+            batch_vars: Vec::new(),
+            cleanup: Vec::new(),
+        };
+        let official_with_dir_cmd =
+            agy_wsl_terminal_command("Ubuntu-26.04", root, &official_with_dir, None).unwrap();
+        assert_eq!(
+            official_with_dir_cmd.line.matches("--gemini_dir=").count(),
+            1,
+            "{}",
+            official_with_dir_cmd.line
+        );
+        assert!(
+            !official_with_dir_cmd.line.contains("ln -sfn"),
+            "{}",
+            official_with_dir_cmd.line
+        );
+
+        let key = ProviderLaunch {
+            title: "Using a private Antigravity profile for this provider:",
+            detail: None,
+            program: "agy",
+            args: vec![r"--gemini_dir=C:\Users\alice\.cc-switch\agy\relay".to_string()],
+            batch_command: "agy".to_string(),
+            env: vec![
+                ("GEMINI_API_KEY", Some("secret".to_string())),
+                (
+                    "GOOGLE_GEMINI_BASE_URL",
+                    Some("https://example.test".to_string()),
+                ),
+            ],
+            batch_vars: Vec::new(),
+            cleanup: Vec::new(),
+        };
+        let key_terminal = agy_wsl_terminal_command("Ubuntu-26.04", root, &key, None).unwrap();
+        assert!(
+            key_terminal.line.contains("wsl.exe -d Ubuntu-26.04"),
+            "{}",
+            key_terminal.line
+        );
+        assert!(
+            key_terminal
+                .line
+                .contains("--gemini_dir=/mnt/c/Users/alice/.cc-switch/agy/relay"),
+            "{}",
+            key_terminal.line
+        );
+        assert!(
+            key_terminal.line.contains("ln -sfn"),
+            "{}",
+            key_terminal.line
+        );
+        assert!(
+            key_terminal.line.contains("/home/alice/.gemini/config"),
+            "{}",
+            key_terminal.line
+        );
+        assert!(
+            key_terminal.line.contains("GEMINI_API_KEY="),
+            "{}",
+            key_terminal.line
+        );
+
+        let usage = agy_wsl_usage_command("Ubuntu-26.04", root).unwrap();
+        assert!(usage.starts_with("wsl.exe -d Ubuntu-26.04 -- "), "{usage}");
+        assert!(
+            usage.contains(crate::services::subscription_agy::USAGE_OUTPUT_SENTINEL),
+            "{usage}"
+        );
+        assert!(
+            usage.contains("agy --gemini_dir=/home/alice/.gemini --print /usage"),
+            "{usage}"
+        );
+
+        let models = agy_wsl_models_command("Ubuntu-26.04", root, None, None, None).unwrap();
+        assert!(
+            models.starts_with("wsl.exe -d Ubuntu-26.04 -- "),
+            "{models}"
+        );
+        assert!(
+            models.contains("agy --gemini_dir=/home/alice/.gemini models"),
+            "{models}"
+        );
+    }
+
+    #[test]
+    fn agy_wsl_non_ascii_paths_stay_out_of_batch_bytes_and_pass_via_wslenv() {
+        let root = r"\\wsl.localhost\Ubuntu-26.04\home\张三\.gemini";
+        let cwd = r"\\wsl.localhost\Ubuntu-26.04\home\张三\我的 项目";
+        let profile = r"C:\Users\张三\.cc-switch\agy\relay";
+        let key = ProviderLaunch {
+            title: "Using a private Antigravity profile for this provider:",
+            detail: None,
+            program: "agy",
+            args: vec![
+                format!("--gemini_dir={profile}"),
+                "--model=中文 模型".to_string(),
+            ],
+            batch_command: "agy".to_string(),
+            env: vec![("GEMINI_API_KEY", Some("密钥-中文".to_string()))],
+            batch_vars: Vec::new(),
+            cleanup: Vec::new(),
+        };
+
+        let cmd = agy_wsl_terminal_command("Ubuntu-26.04", root, &key, Some(cwd)).unwrap();
+        assert!(cmd.line.is_ascii(), "line must be pure ASCII: {}", cmd.line);
+        assert!(
+            cmd.set_lines.is_ascii(),
+            "set_lines must be pure ASCII: {}",
+            cmd.set_lines
+        );
+        let values: Vec<&str> = cmd.env.iter().map(|(_, v)| v.as_str()).collect();
+        assert!(values.contains(&"/home/张三/.gemini"), "{values:?}");
+        assert!(values.contains(&"/home/张三/我的 项目"), "{values:?}");
+        assert!(
+            values.contains(&"/mnt/c/Users/张三/.cc-switch/agy/relay"),
+            "{values:?}"
+        );
+        assert!(values.contains(&"密钥-中文"), "{values:?}");
+        assert!(values.contains(&"--model=中文 模型"), "{values:?}");
+
+        let defined_pos = cmd.set_lines.find("if defined WSLENV ").unwrap();
+        let not_defined_pos = cmd.set_lines.find("if not defined WSLENV ").unwrap();
+        assert!(defined_pos < not_defined_pos, "{}", cmd.set_lines);
+        for (name, _) in &cmd.env {
+            assert!(
+                cmd.set_lines.contains(&format!("{name}/u")),
+                "missing {name}/u in {}",
+                cmd.set_lines
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let (payload, carrier) =
+                agy_wsl_terminal_payload("Ubuntu-26.04", root, &key, Some(cwd)).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let base = tmp.path();
+            let real_shared = base.join("home/张三/.gemini");
+            let real_cwd = base.join("home/张三/我的 项目");
+            let real_profile = base.join("mnt/c/Users/张三/.cc-switch/agy/relay");
+            std::fs::create_dir_all(real_shared.join("config")).unwrap();
+            std::fs::create_dir_all(&real_cwd).unwrap();
+            std::fs::create_dir_all(&real_profile).unwrap();
+
+            let bin_dir = base.join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let out_file = base.join("agy-args.txt");
+            let fake_agy = bin_dir.join("agy");
+            std::fs::write(
+                &fake_agy,
+                format!(
+                    "#!/bin/sh\n{{ pwd; printf '%s\\n' \"$GEMINI_API_KEY\"; printf '%s\\n' \"$@\"; }} > \"{}\"\n",
+                    out_file.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake_agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let mut proc_cmd = std::process::Command::new("sh");
+            proc_cmd.arg("-c").arg(&payload);
+            for (name, val) in &carrier.entries {
+                let mapped = val
+                    .replace("/home/张三", &base.join("home/张三").to_string_lossy())
+                    .replace(
+                        "/mnt/c/Users/张三",
+                        &base.join("mnt/c/Users/张三").to_string_lossy(),
+                    );
+                proc_cmd.env(name, mapped);
+            }
+            let path_env = format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            proc_cmd.env("PATH", path_env);
+            let status = proc_cmd.status().unwrap();
+            assert!(status.success());
+
+            let recorded = std::fs::read_to_string(&out_file).unwrap();
+            let lines: Vec<&str> = recorded.lines().collect();
+            assert_eq!(lines[0], real_cwd.to_string_lossy());
+            assert_eq!(lines[1], "密钥-中文");
+            assert_eq!(
+                lines[2],
+                format!("--gemini_dir={}", real_profile.to_string_lossy())
+            );
+            assert_eq!(lines[3], "--model=中文 模型");
+            assert_eq!(
+                std::fs::read_link(real_profile.join("config")).unwrap(),
+                real_shared.join("config")
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agy_terminal_launch_includes_custom_local_root_and_model_for_official_card() {
+        struct ResetHome(Option<std::ffi::OsString>);
+        impl Drop for ResetHome {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                    None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+                }
+                let _ = crate::settings::reload_settings();
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let _reset = ResetHome(std::env::var_os("CC_SWITCH_TEST_HOME"));
+        std::env::set_var("CC_SWITCH_TEST_HOME", home.path());
+        crate::settings::reload_settings().unwrap();
+
+        let custom_root = home.path().join("custom-agy-gemini");
+        let mut settings = crate::settings::get_settings();
+        settings.agy_config_dir = Some(custom_root.to_string_lossy().into_owned());
+        crate::settings::update_settings(settings).unwrap();
+
+        let provider = crate::provider::Provider::with_id(
+            "official".into(),
+            "Antigravity".into(),
+            serde_json::json!({"config": {"model": {"name": "Gemini 3.8 Flash (High)"}}}),
+            None,
+        );
+        let launch = agy_terminal_launch(&provider).unwrap();
+        assert_eq!(launch.detail, None);
+        assert_eq!(
+            launch.args,
+            vec![
+                format!("--gemini_dir={}", custom_root.to_string_lossy()),
+                "--model=Gemini 3.8 Flash (High)".to_string(),
+            ]
+        );
+        assert_eq!(
+            launch.batch_command,
+            format!(
+                "agy \"--gemini_dir=%{AGY_DIR_BATCH_VAR}%\" \"--model=%{AGY_MODEL_BATCH_VAR}%\""
+            )
+        );
+        assert_eq!(
+            launch.batch_vars,
+            vec![
+                (
+                    AGY_DIR_BATCH_VAR,
+                    custom_root.to_string_lossy().into_owned()
+                ),
+                (AGY_MODEL_BATCH_VAR, "Gemini 3.8 Flash (High)".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn shell_command_missing_matches_shell_formats_only() {
         assert!(is_shell_command_missing(
             "bash: line 1: claude: command not found",
@@ -7092,6 +8051,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_coordinator_reports_queue_only_while_waiting() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let coordinator = Arc::new(ToolLifecycleCoordinator::default());
+        let queued = Arc::new(AtomicUsize::new(0));
+        let notice = |count: &Arc<AtomicUsize>| {
+            let count = count.clone();
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+
+        // 没有别的写入在跑时直接执行，不显示排队
+        coordinator
+            .run_with_queue_notice(vec!["codex"], notice(&queued), |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(queued.load(Ordering::SeqCst), 0);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let first = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .run(vec!["codex"], move |_| {
+                        started_tx.send(()).unwrap();
+                        finish_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+        let second = coordinator.run_with_queue_notice(vec!["claude"], notice(&queued), |_| Ok(()));
+        tokio::pin!(second);
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert_eq!(queued.load(Ordering::SeqCst), 1);
+
+        finish_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap();
+        assert_eq!(queued.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn lifecycle_coordinator_keeps_running_locks_when_caller_is_cancelled() {
         let coordinator = Arc::new(ToolLifecycleCoordinator::default());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -7167,7 +8171,8 @@ mod tests {
                 scope.spawn(move || {
                     let command = format!("@echo off\r\n>\"{}\" echo %~f0\r\n", output.display());
                     barrier.wait();
-                    run_tool_lifecycle_silently(&command, "tool_update").unwrap();
+                    let progress = ToolLifecycleProgress::noop();
+                    run_tool_lifecycle_silently(&command, "tool_update", &progress).unwrap();
                 });
             }
         });
@@ -7368,6 +8373,31 @@ mod tests {
         let detail = "cache write failed".to_string();
         assert_eq!(append_npm_bin_collision_hint(detail.clone(), raw), detail);
         assert_eq!(npm_bin_collision_path("npm error code E404"), None);
+    }
+
+    #[test]
+    fn npm_bin_collision_detail_survives_trailing_noise() {
+        let raw = [
+            "npm error code EEXIST",
+            "npm error path /home/me/.local/bin/pi",
+            "npm error EEXIST: file already exists",
+            "npm error File exists: /home/me/.local/bin/pi",
+            "npm error Remove the existing file and try again, or run npm",
+            "npm error with --force to overwrite files recklessly.",
+            "npm notice",
+            "npm notice New major version of npm available! 10.9.2 -> 11.6.0",
+            "npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.6.0",
+            "npm notice To update run: npm install -g npm@11.6.0",
+            "npm notice",
+            "npm error A complete log of this run can be found in: /tmp/debug-0.log",
+        ]
+        .join("\n");
+        assert_eq!(
+            npm_bin_collision_detail(&raw).as_deref(),
+            Some("npm error code EEXIST\nnpm error File exists: /home/me/.local/bin/pi")
+        );
+        assert_eq!(npm_bin_collision_detail("npm error code E404"), None);
+        assert_eq!(npm_bin_collision_detail("EEXIST without a path"), None);
     }
 
     /// 探测 helper 正常路径：spawn（含 pre_exec setsid）能启动、输出能捕获。
@@ -7645,6 +8675,28 @@ mod tests {
     }
 
     #[test]
+    fn grok_launch_runs_plain_grok_against_the_managed_home() {
+        let mut launch = grok_launch("/home/me/.grok".to_string());
+        launch.skip_permissions();
+        launch
+            .append_user_args(vec!["--model".to_string(), "grok-4.6".to_string()])
+            .unwrap();
+        assert_eq!(launch.program, "grok");
+        assert_eq!(launch.args, vec!["--always-approve", "--model", "grok-4.6"]);
+        assert_eq!(
+            launch.batch_command,
+            "call grok --always-approve \"%CC_SWITCH_ARG0%\" \"%CC_SWITCH_ARG1%\""
+        );
+        assert_eq!(
+            launch.env,
+            vec![("GROK_HOME", Some("/home/me/.grok".to_string()))]
+        );
+        assert!(unix_launch_command(&launch).starts_with(
+            "env -u CC_SWITCH_LAUNCH_ENV_0 GROK_HOME=\"$CC_SWITCH_LAUNCH_ENV_0\" grok "
+        ));
+    }
+
+    #[test]
     fn codex_launch_passes_overrides_as_separate_arguments() {
         let mut launch = codex_launch(
             "Kimi",
@@ -7711,6 +8763,128 @@ mod tests {
         let launch = agy_terminal_launch(&row).unwrap();
         assert_eq!(unix_launch_command(&launch), "agy");
         assert_eq!(launch.batch_command, "agy");
+    }
+
+    fn copilot_byok_launch(settings: serde_json::Value) -> crate::copilot_config::CopilotLaunch {
+        crate::copilot_config::prepare_launch("relay", &settings).unwrap()
+    }
+
+    #[test]
+    fn copilot_byok_launch_selects_the_card_model_and_clears_byok_variables() {
+        let launch = copilot_byok_launch(serde_json::json!({
+            "provider": {"baseUrl":"https://relay.test/v1","apiKey":"fixture-key","wireApi":"responses"},
+            "models": [{"id":"gpt-5.4"}]
+        }));
+        // A bound account never applies to bring-your-own-model cards.
+        let launch =
+            copilot_launch_command("Relay", launch, Some(("gho_x".into(), "github.com".into())))
+                .unwrap();
+        let command = unix_launch_command(&launch);
+        assert!(
+            command.ends_with(" copilot --model=relay/gpt-5.4"),
+            "{command}"
+        );
+        assert!(!command.contains("fixture-key"), "{command}");
+        assert!(!command.contains("gho_x"), "{command}");
+        // providers.json is ignored while any COPILOT_PROVIDER_* is set, so all are cleared.
+        for key in crate::copilot_config::BYOK_ENV_KEYS {
+            assert!(command.contains(&format!("-u {key}")), "{key}: {command}");
+        }
+        assert!(command.contains("-u COPILOT_MODEL"), "{command}");
+        let env_file = unix_launch_env_file(&launch);
+        assert!(!env_file.contains("fixture-key"));
+        assert!(!env_file.contains("gho_x"));
+        assert_eq!(
+            launch.batch_command,
+            format!("call copilot \"--model=%{COPILOT_MODEL_BATCH_VAR}%\"")
+        );
+        assert_eq!(
+            launch.batch_vars,
+            vec![(COPILOT_MODEL_BATCH_VAR, "relay/gpt-5.4".to_string())]
+        );
+    }
+
+    #[test]
+    fn copilot_launch_passes_the_card_reasoning_effort() {
+        let launch = copilot_byok_launch(serde_json::json!({
+            "provider": {"baseUrl":"https://relay.test/v1","apiKey":"fixture-key","wireApi":"responses"},
+            "models": [{"id":"deepseek-v4-flash"}],
+            "reasoningEffort":"none"
+        }));
+        let mut launch = copilot_launch_command("Relay", launch, None).unwrap();
+        assert!(
+            unix_launch_command(&launch)
+                .ends_with(" copilot --model=relay/deepseek-v4-flash --reasoning-effort=none"),
+            "{}",
+            unix_launch_command(&launch)
+        );
+        assert_eq!(
+            launch.batch_command,
+            format!("call copilot \"--model=%{COPILOT_MODEL_BATCH_VAR}%\" --reasoning-effort=none")
+        );
+
+        launch.skip_permissions();
+        assert!(
+            unix_launch_command(&launch).ends_with(" --reasoning-effort=none --allow-all"),
+            "{}",
+            unix_launch_command(&launch)
+        );
+        assert!(launch
+            .batch_command
+            .ends_with(" --reasoning-effort=none --allow-all"));
+
+        // 「打开终端」里的附加参数接在 `--allow-all` 后面
+        launch
+            .append_user_args(vec!["--add-dir".into(), "/tmp/a b".into()])
+            .unwrap();
+        assert!(
+            unix_launch_command(&launch)
+                .ends_with(" --reasoning-effort=none --allow-all --add-dir '/tmp/a b'"),
+            "{}",
+            unix_launch_command(&launch)
+        );
+        assert!(launch.batch_command.ends_with(
+            " --reasoning-effort=none --allow-all \"%CC_SWITCH_ARG0%\" \"%CC_SWITCH_ARG1%\""
+        ));
+    }
+
+    #[test]
+    fn copilot_login_launch_uses_the_model_flag_and_bound_account() {
+        let mut row = crate::provider::Provider::with_id(
+            "login".into(),
+            "GitHub".into(),
+            serde_json::json!({"env":{"COPILOT_MODEL":"claude-sonnet-4.6"}}),
+            None,
+        );
+        row.category = Some("official".into());
+        let launch = copilot_terminal_launch(&row, None).unwrap();
+        let command = unix_launch_command(&launch);
+        assert!(
+            command.ends_with(" copilot --model=claude-sonnet-4.6"),
+            "{command}"
+        );
+        assert!(
+            command.contains("-u COPILOT_PROVIDER_BASE_URL"),
+            "{command}"
+        );
+        assert_eq!(
+            launch.batch_command,
+            format!("call copilot \"--model=%{COPILOT_MODEL_BATCH_VAR}%\"")
+        );
+
+        let launch = copilot_terminal_launch(
+            &row,
+            Some(("gho_fixture".into(), "github.example.com".into())),
+        )
+        .unwrap();
+        assert!(!unix_launch_command(&launch).contains("gho_fixture"));
+        let env_file = unix_launch_env_file(&launch);
+        assert!(env_file.contains("gho_fixture"));
+        assert!(env_file.contains("github.example.com"));
+
+        row.settings_config = serde_json::json!({"env":{}});
+        let launch = copilot_terminal_launch(&row, None).unwrap();
+        assert!(unix_launch_command(&launch).ends_with(" copilot"));
     }
 
     #[cfg(unix)]
@@ -11752,6 +12926,86 @@ mod tests {
         assert_eq!(
             windows_preferred_tool_executable("opencode", &standalone),
             Some(standalone)
+        );
+    }
+
+    #[test]
+    fn foreign_pip_launcher_only_rejects_pi_exe_in_scripts_dir() {
+        let pip_pi = Path::new(r"D:\soft\Python\Python311\Scripts\pi.exe");
+        assert!(is_foreign_pip_launcher("pi", pip_pi));
+        assert!(is_foreign_pip_launcher(
+            "pi",
+            Path::new(r"C:\venvs\tools\SCRIPTS\PI.EXE")
+        ));
+        assert!(!is_foreign_pip_launcher(
+            "pi",
+            Path::new(r"C:\Users\me\AppData\Roaming\npm\pi.cmd")
+        ));
+        // A custom npm prefix under a `Scripts` folder writes `.cmd` shims.
+        assert!(!is_foreign_pip_launcher(
+            "pi",
+            Path::new(r"D:\Scripts\npm-global\pi.cmd")
+        ));
+        assert!(!is_foreign_pip_launcher(
+            "pi",
+            Path::new(r"D:\Scripts\pi.cmd")
+        ));
+        // Bun's global shims are `.exe` but live in `.bun\bin`.
+        assert!(!is_foreign_pip_launcher(
+            "pi",
+            Path::new(r"C:\Users\me\.bun\bin\pi.exe")
+        ));
+        // Hermes really is installed by pip.
+        assert!(!is_foreign_pip_launcher(
+            "hermes",
+            Path::new(r"D:\soft\Python\Python311\Scripts\hermes.exe")
+        ));
+    }
+
+    #[test]
+    fn vscode_copilot_shim_is_rejected_but_real_copilot_is_kept() {
+        assert!(is_vscode_copilot_shim(
+            "copilot",
+            Path::new(r"D:\Microsoft VS Code\bin\copilot-shim\copilot.exe")
+        ));
+        assert!(is_vscode_copilot_shim(
+            "copilot",
+            Path::new(r"C:\Program Files\Microsoft VS Code\bin\COPILOT-SHIM\copilot.cmd")
+        ));
+        // npm's global shim is the real CLI.
+        assert!(!is_vscode_copilot_shim(
+            "copilot",
+            Path::new(r"C:\Users\me\AppData\Roaming\npm\copilot.cmd")
+        ));
+        // Only the copilot tool is affected.
+        assert!(!is_vscode_copilot_shim(
+            "codex",
+            Path::new(r"D:\x\copilot-shim\codex.exe")
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_path_default_skips_pip_pi_and_uses_npm_pi() {
+        let root = tempfile::tempdir().expect("temp dir should be created");
+        let scripts = root.path().join("Python311").join("Scripts");
+        std::fs::create_dir_all(&scripts).expect("Scripts dir should be created");
+        let pip_pi = scripts.join("pi.exe");
+        std::fs::write(&pip_pi, "").expect("pip launcher should be created");
+        assert!(tool_executable_candidates("pi", &scripts)
+            .iter()
+            .all(|candidate| candidate != &pip_pi));
+
+        let npm = root.path().join("npm");
+        std::fs::create_dir_all(&npm).expect("npm dir should be created");
+        let npm_pi = npm.join("pi.cmd");
+        std::fs::write(&npm_pi, "").expect("npm shim should be created");
+
+        let raw = format!("{}\r\n{}\r\n", pip_pi.display(), npm_pi.display());
+        assert_eq!(windows_preferred_path_default("pi", &raw), Some(npm_pi));
+        assert_eq!(
+            windows_preferred_path_default("pi", &format!("{}\r\n", pip_pi.display())),
+            None
         );
     }
 

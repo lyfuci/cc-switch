@@ -30,27 +30,96 @@ pub fn get_home_dir() -> PathBuf {
     })
 }
 
-/// 检测路径是否为 WSL 网络路径（如 \\wsl$\Ubuntu\... 或 \\wsl.localhost\Ubuntu\...）
-/// 注意：仅检测直接 UNC 路径，映射磁盘符（如 Z: -> \\wsl$\...）无法检测
-#[cfg(windows)]
+/// 检测路径是否为 WSL 网络路径（如 `\\wsl$\Ubuntu\...` 或 `\\wsl.localhost\Ubuntu\...`）。
+/// 映射盘符（如 `Z:` → `\\wsl$\...`）认不出来。字符串形态在非 Windows 上也能认，
+/// 这样技能同步对 UNC 目标走复制，测试不必真的挂载 WSL。
 pub(crate) fn is_wsl_path(path: &Path) -> bool {
-    use std::path::Prefix;
-    if let Some(Component::Prefix(prefix)) = path.components().next() {
-        match prefix.kind() {
-            Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _) => {
-                let s = server.to_string_lossy();
-                s.eq_ignore_ascii_case("wsl$") || s.eq_ignore_ascii_case("wsl.localhost")
-            }
-            _ => false,
-        }
-    } else {
-        false
+    if wsl_unc_to_linux(&path.to_string_lossy()).is_some() {
+        return true;
     }
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            if let Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _) = prefix.kind() {
+                let server = server.to_string_lossy();
+                return server.eq_ignore_ascii_case("wsl$")
+                    || server.eq_ignore_ascii_case("wsl.localhost");
+            }
+        }
+    }
+    false
 }
 
-#[cfg(not(windows))]
-pub(crate) fn is_wsl_path(_path: &Path) -> bool {
-    false
+/// `\\wsl.localhost\<distro>\home\...`, `\\wsl$\<distro>\...`, `//wsl.localhost/...`,
+/// and `\\?\UNC\wsl.localhost\...`. Returns `(distro, /linux/path)`.
+pub(crate) fn wsl_unc_to_linux(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let slashed = trimmed.replace('/', "\\");
+    let verbatim = r"\\?\UNC\";
+    let normalized = if slashed
+        .as_bytes()
+        .get(..verbatim.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(verbatim.as_bytes()))
+    {
+        format!(r"\\{}", &slashed[verbatim.len()..])
+    } else {
+        slashed
+    };
+    let rest = normalized.strip_prefix(r"\\")?;
+    let mut parts = rest.split('\\').filter(|part| !part.is_empty());
+    let server = parts.next()?;
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return None;
+    }
+    let distro = parts.next()?.to_string();
+    if !is_wsl_distro_name(&distro) {
+        return None;
+    }
+    let mut linux = String::new();
+    for part in parts {
+        if part == "." || part == ".." {
+            return None;
+        }
+        linux.push('/');
+        linux.push_str(part);
+    }
+    if linux.is_empty() {
+        return None;
+    }
+    Some((distro, linux))
+}
+
+fn is_wsl_distro_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// A WSL UNC path in `distro`, or a Windows drive path (`C:\...` → `/mnt/c/...`).
+#[cfg(any(windows, test))]
+pub(crate) fn path_into_wsl(raw: &str, distro: &str) -> Option<String> {
+    if let Some((found, linux)) = wsl_unc_to_linux(raw) {
+        return found.eq_ignore_ascii_case(distro).then_some(linux);
+    }
+    let normalized = raw.trim().replace('/', "\\");
+    let mut chars = normalized.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
+        return None;
+    }
+    let rest = chars.as_str().trim_start_matches('\\');
+    let mut linux = format!("/mnt/{}", drive.to_ascii_lowercase());
+    if !rest.is_empty() {
+        linux.push('/');
+        linux.push_str(&rest.replace('\\', "/"));
+    }
+    Some(linux)
 }
 
 /// 临时目录在 WSL 共享路径上时（WSL2 夜间测试），SQLite 拿不到文件锁，
@@ -140,7 +209,7 @@ fn comparable_path_key(path: &Path) -> String {
     key
 }
 
-fn path_eq_lexical(left: &Path, right: &Path) -> bool {
+pub(crate) fn path_eq_lexical(left: &Path, right: &Path) -> bool {
     comparable_path_key(left) == comparable_path_key(right)
 }
 
@@ -360,28 +429,6 @@ pub fn get_app_config_path() -> PathBuf {
     get_app_config_dir().join("config.json")
 }
 
-/// 清理供应商名称，确保文件名安全
-#[allow(dead_code)]
-pub fn sanitize_provider_name(name: &str) -> String {
-    name.chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
-            _ => c,
-        })
-        .collect::<String>()
-        .to_lowercase()
-}
-
-/// 获取供应商配置文件路径
-#[allow(dead_code)]
-pub fn get_provider_config_path(provider_id: &str, provider_name: Option<&str>) -> PathBuf {
-    let base_name = provider_name
-        .map(sanitize_provider_name)
-        .unwrap_or_else(|| sanitize_provider_name(provider_id));
-
-    get_claude_config_dir().join(format!("settings-{base_name}.json"))
-}
-
 /// 读取 JSON 配置文件
 pub fn read_json_file<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, AppError> {
     if !path.exists() {
@@ -490,6 +537,16 @@ impl StagedWrite {
         &self.tmp
     }
 
+    /// 提交时实际被替换的文件（目标是软链接时为它最终指向的文件）。
+    pub fn target(&self) -> &Path {
+        &self.path
+    }
+
+    /// 放弃这次写入，删掉临时文件。
+    pub fn discard(self) {
+        let _ = fs::remove_file(&self.tmp);
+    }
+
     /// 用临时文件替换目标（失败时删掉临时文件）。
     pub fn commit(self) -> Result<(), AppError> {
         commit_staged(&self.tmp, &self.path).inspect_err(|_| {
@@ -508,6 +565,9 @@ pub(crate) fn stage_write(
 ) -> Result<StagedWrite, AppError> {
     #[cfg(not(unix))]
     let _ = unix_mode;
+
+    let resolved = resolve_symlink_target(path);
+    let path = resolved.as_path();
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
@@ -585,11 +645,76 @@ pub(crate) fn stage_write(
     })
 }
 
+/// 目标是软链接时返回它最终指向的文件（逐跳 `read_link`，相对目标按链接所在目录解析），
+/// 否则原样返回。原子写要替换的是这个最终文件：rename 到软链接本身会把链接换成普通
+/// 文件（Unix），Windows 的 `ReplaceFileW` 则直接报 os error 1464。只解析最后一段，
+/// 不碰路径里的目录软链；除相对目标带 `..` 外不做 `canonicalize`（Windows 上会把路径
+/// 改写成 `\\?\` 形式），普通文件原样返回。
+/// 悬空链接照样返回它指向的路径，写入时会在那里新建文件、链接保留。
+pub(crate) fn resolve_symlink_target(path: &Path) -> PathBuf {
+    // 与 Linux 的 MAXSYMLINKS 一致，防止链接成环时死循环。
+    const MAX_HOPS: usize = 40;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        let is_link = fs::symlink_metadata(&current)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            return current;
+        }
+        let Ok(target) = fs::read_link(&current) else {
+            return current;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            match current.parent() {
+                Some(parent) => join_link_target(parent, &target),
+                None => target,
+            }
+        };
+    }
+    log::warn!("软链接层数过多，按原路径写入: {}", path.display());
+    path.to_path_buf()
+}
+
+/// 把相对链接目标接到链接所在目录上。目标里有 `..` 时先把目录解析成真实路径再逐段
+/// 回退：Windows 按字面折叠 `..`，链接所在目录本身是 junction / 目录软链时会退到
+/// 错误的上级目录（Unix 内核按真实路径解析，结果一样）。
+fn join_link_target(parent: &Path, target: &Path) -> PathBuf {
+    if !target
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return parent.join(target);
+    }
+    let Ok(mut resolved) = fs::canonicalize(parent) else {
+        return parent.join(target);
+    };
+    for component in target.components() {
+        match component {
+            Component::ParentDir => {
+                // 已走过的段里也可能有目录软链，回退前先解析成真实路径。
+                if let Ok(real) = fs::canonicalize(&resolved) {
+                    resolved = real;
+                }
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    resolved
+}
+
 /// 原子写的后半步：用 `tmp` 替换 `path`。崩溃恢复也用它提交上次留下的临时文件。
+/// `path` 是软链接时替换它指向的文件，链接本身保留。
 ///
 /// 失败时临时文件留在原处：写入引擎的 pending 指着它，下次恢复要靠它前滚（目标文件被
 /// 占用、只读这类失败，过后多半能补完）。只做一次性原子写的调用方自己删。
 pub(crate) fn commit_staged(tmp: &Path, path: &Path) -> Result<(), AppError> {
+    let resolved = resolve_symlink_target(path);
+    let path = resolved.as_path();
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -750,6 +875,111 @@ mod tests {
         // 一次性的原子写不留临时文件。
         assert!(staged.commit().is_err());
         assert!(!tmp.exists());
+    }
+
+    /// dotfiles 用户把 settings.json 等配置软链到别的目录（#6764 / #9283）：原子写要
+    /// 写透到链接指向的文件，链接本身保留，临时文件建在目标旁边、不留残留。
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_writes_through_symlinks_and_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let real = dotfiles.join("settings.json");
+        std::fs::write(&real, b"old contents").unwrap();
+        // 相对链接 + 两跳：home/settings.json -> home/hop.json -> ../dotfiles/settings.json
+        let hop = home.join("hop.json");
+        let link = home.join("settings.json");
+        std::os::unix::fs::symlink("../dotfiles/settings.json", &hop).unwrap();
+        std::os::unix::fs::symlink("hop.json", &link).unwrap();
+
+        atomic_write_private(&link, b"new contents").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&hop)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"new contents");
+        for d in [&dotfiles, &home] {
+            let leftovers: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|name| name.contains(".tmp."))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "temporary files remain: {leftovers:?}"
+            );
+        }
+
+        // 写入引擎的两步写（以及崩溃前滚）拿的也是链接路径。
+        let staged = stage_write(&link, b"engine contents", None, false).unwrap();
+        assert_eq!(
+            staged.tmp_path().parent().unwrap().canonicalize().unwrap(),
+            dotfiles.canonicalize().unwrap()
+        );
+        let tmp = staged.tmp_path().to_path_buf();
+        commit_staged(&tmp, &link).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"engine contents");
+    }
+
+    /// 链接所在目录本身是目录软链、相对目标带 `..` 时，`..` 要按真实目录回退。
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_dir_is_resolved_before_walking_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let sync = dir.path().join("sync");
+        let real_dir = sync.join("claude");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = sync.join("settings.json");
+        std::fs::write(&real, b"old").unwrap();
+        std::os::unix::fs::symlink("../settings.json", real_dir.join("settings.json")).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&real_dir, home.join(".claude")).unwrap();
+        let link = home.join(".claude").join("settings.json");
+
+        assert_eq!(resolve_symlink_target(&link), real.canonicalize().unwrap());
+        atomic_write(&link, b"new").unwrap();
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+
+        // 目标里先经过一个目录软链再回退：`sub/../other.json`，sub -> sync/claude。
+        let other = sync.join("other.json");
+        std::fs::write(&other, b"old").unwrap();
+        std::os::unix::fs::symlink(&real_dir, home.join("sub")).unwrap();
+        let link2 = home.join("other.json");
+        std::os::unix::fs::symlink("sub/../other.json", &link2).unwrap();
+        assert_eq!(
+            resolve_symlink_target(&link2),
+            other.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_the_target_of_a_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        atomic_write(&link, b"contents").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"contents");
     }
 
     #[cfg(windows)]
@@ -1049,6 +1279,40 @@ mod tests {
         assert_eq!(
             dir, expected,
             "测试 home 优先：不得回退到 HOME 下的旧库目录"
+        );
+    }
+
+    #[test]
+    fn non_ascii_paths_do_not_panic_and_parse_wsl_unc_roots() {
+        for path in [
+            "/Users/张三/.claude.json",
+            r"D:\开发\project",
+            "/home/用户/.gemini",
+            "中文路径",
+        ] {
+            assert!(
+                !is_wsl_path(Path::new(path)),
+                "unexpected WSL match: {path}"
+            );
+            assert_eq!(wsl_unc_to_linux(path), None);
+        }
+
+        for raw in [
+            r"\\wsl.localhost\Ubuntu\home\张三\.gemini",
+            r"\\wsl$\Ubuntu\home\张三\.gemini",
+            r"\\?\UNC\wsl.localhost\Ubuntu\home\张三\.gemini",
+        ] {
+            assert!(is_wsl_path(Path::new(raw)), "expected WSL match: {raw}");
+            assert_eq!(
+                wsl_unc_to_linux(raw),
+                Some(("Ubuntu".into(), "/home/张三/.gemini".into())),
+                "{raw}"
+            );
+        }
+
+        assert_eq!(
+            path_into_wsl(r"D:\开发\project", "Ubuntu"),
+            Some("/mnt/d/开发/project".into())
         );
     }
 }
