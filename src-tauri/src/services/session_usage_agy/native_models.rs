@@ -91,9 +91,6 @@ pub(super) struct Timing {
 
 #[derive(Default)]
 pub(super) struct Generation {
-    /// First usable raw string, field 21 then field 19. Kept for callers that
-    /// only need one label.
-    pub model: Option<String>,
     /// `gen_metadata.data` response field 21. Tiered id (`gemini-4-argon-high`)
     /// or, in an Orchestrator conversation, the selector (`gemini-pro-orchestrator`).
     pub model_id: Option<String>,
@@ -248,13 +245,11 @@ fn read_generations(path: &Path, steps: &[u64]) -> Result<HashMap<u64, Generatio
             .ok()
             .and_then(|metadata| metadata.response)
             .and_then(|response| usable(response.model));
-        let model = model_id.clone().or(model_name.clone());
         let timing = timing_of(&bytes);
-        if model.is_some() || timing.is_some() {
+        if model_id.is_some() || model_name.is_some() || timing.is_some() {
             generations.insert(
                 step,
                 Generation {
-                    model,
                     model_id,
                     model_name,
                     timing,
@@ -269,7 +264,9 @@ fn read_generations(path: &Path, steps: &[u64]) -> Result<HashMap<u64, Generatio
 fn read_models(path: &Path, steps: &[u64]) -> Result<HashMap<u64, String>, String> {
     Ok(read_generations(path, steps)?
         .into_iter()
-        .filter_map(|(step, generation)| Some((step, generation.model?)))
+        .filter_map(|(step, generation)| {
+            Some((step, generation.model_id.or(generation.model_name)?))
+        })
         .collect())
 }
 
@@ -520,7 +517,13 @@ mod tests {
             })
         );
         for step in [2, 3, 4] {
-            assert_eq!(got[&step].model.as_deref(), Some("gemini-4-argon"));
+            assert_eq!(
+                got[&step]
+                    .model_id
+                    .as_deref()
+                    .or(got[&step].model_name.as_deref()),
+                Some("gemini-4-argon")
+            );
             assert_eq!(got[&step].timing, None, "step {step}");
         }
     }

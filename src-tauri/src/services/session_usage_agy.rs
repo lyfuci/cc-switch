@@ -53,7 +53,7 @@ fn sync_agy_usage_from_files(
         };
         let modified = metadata_modified_nanos(&metadata);
         let size = metadata.len() as i64;
-        let native_state = native_models::native_state_fingerprint(&path);
+        let native_state = format!("v2:{}", native_models::native_state_fingerprint(&path));
         // Rows stored as the Orchestrator selector (or the raw worker alias) are
         // not finished. Re-read them even when the transcript and database are
         // unchanged, the same way an `unknown` row is replaced once a model exists.
@@ -495,9 +495,17 @@ fn parent_model(transcript: &Path, child_start: Option<i64>) -> (Option<String>,
         match native_models::generations_for_transcript(&parent_transcript, &wanted) {
             Ok(generations) => {
                 for (step, at) in steps {
-                    if let Some(model) = generations.get(&step).and_then(|item| item.model.clone())
-                    {
-                        events.push((at, model));
+                    if let Some(generation) = generations.get(&step) {
+                        let mut candidates = Vec::new();
+                        if let Some(model_id) = generation.model_id.as_deref() {
+                            candidates.push(model_id);
+                        }
+                        if let Some(model_name) = generation.model_name.as_deref() {
+                            candidates.push(model_name);
+                        }
+                        if let Some((resolved, _)) = resolve_step_model(&candidates) {
+                            events.push((at, resolved));
+                        }
                     }
                 }
             }
@@ -533,6 +541,9 @@ fn model_active_before(events: &[(i64, String)], child_start: Option<i64>) -> Op
 enum AgyModelClass {
     /// A model id the rest of the app can price or display.
     Real(String),
+    /// Generic unversioned label (such as `Gemini Flash` in Orchestrator worker
+    /// `gen_metadata` field 21) that yields to a concrete model in `candidates`.
+    Generic(String),
     /// Orchestrator is a mode. `planner` is Gemini 4 Carbon or Argon when the
     /// label says which one.
     Selector { planner: Option<&'static str> },
@@ -548,6 +559,9 @@ fn classify_agy_model(raw: &str) -> Option<AgyModelClass> {
         "gemini-flash-worker-agy" | "gemini-flash-worker" => {
             AgyModelClass::Real("gemini-4-hydrogen".into())
         }
+        // Orchestrator worker generations write bare "Gemini Flash" in field 21;
+        // let field 19 (`gemini-flash-worker-agy`) resolve the concrete model.
+        "gemini-flash" => AgyModelClass::Generic(id),
         // Selector labels. They are not models. The unsuffixed pro-orchestrator
         // is the Carbon mode; the argon variant names itself.
         "orchestrator-carbon" | "gemini-pro-orchestrator" => AgyModelClass::Selector {
@@ -569,12 +583,17 @@ fn row_real_model(row: &Value) -> Option<String> {
     }
 }
 
-/// `(model id, display)`. A real per-step string wins, in the order given.
-/// A selector is used only when nothing in the list is a real model, and then
-/// only as its planner (`gemini-4-carbon` or `gemini-4-argon`).
+/// `(model id, display)`. A real per-step string wins, in the order given, followed
+/// by unversioned generic labels. A selector is used only when nothing else names a
+/// model, and then only as its planner (`gemini-4-carbon` or `gemini-4-argon`).
 fn resolve_step_model(candidates: &[&str]) -> Option<(String, String)> {
     for raw in candidates {
         if let Some(AgyModelClass::Real(id)) = classify_agy_model(raw) {
+            return Some((id, (*raw).to_string()));
+        }
+    }
+    for raw in candidates {
+        if let Some(AgyModelClass::Generic(id)) = classify_agy_model(raw) {
             return Some((id, (*raw).to_string()));
         }
     }
@@ -1346,12 +1365,29 @@ mod tests {
             resolve_step_model(&["Orchestrator (Argon)"]).unwrap().0,
             "gemini-4-argon"
         );
-        // The worker on this step wins over the conversation selector.
+        // The worker on this step wins over the conversation selector and over generic
+        // "Gemini Flash" labels in field 21.
         assert_eq!(
             resolve_step_model(&["Orchestrator (Carbon)", "gemini-flash-worker-agy"])
                 .unwrap()
                 .0,
             "gemini-4-hydrogen"
+        );
+        assert_eq!(
+            resolve_step_model(&[
+                "Gemini Flash",
+                "gemini-flash-worker-agy",
+                "Orchestrator (Carbon)"
+            ])
+            .unwrap()
+            .0,
+            "gemini-4-hydrogen"
+        );
+        assert_eq!(
+            resolve_step_model(&["Gemini 4 Hydrogen (High)", "gemini-flash-worker-agy"])
+                .unwrap()
+                .0,
+            "gemini-4-hydrogen-high"
         );
         assert!(resolve_step_model(&["Orchestrator"]).is_none());
     }
@@ -1391,6 +1427,12 @@ mod tests {
             "gemini-4-carbon",
             &native_models::test_model_id("gemini-pro-orchestrator"),
         );
+        native_models::set_test_generation(
+            &native,
+            1,
+            "gemini-flash-worker-agy",
+            &native_models::test_model_id("Gemini Flash"),
+        );
         drop(native);
 
         let db = Database::memory().unwrap();
@@ -1413,8 +1455,7 @@ mod tests {
         assert!(planner.1.parse::<f64>().unwrap() > 0.0, "{}", planner.1);
         let worker = model(2);
         assert_eq!(worker.0, "gemini-4-hydrogen");
-        // No official Hydrogen price is seeded.
-        assert_eq!(worker.1, "0");
+        assert!(worker.1.parse::<f64>().unwrap() > 0.0, "{}", worker.1);
         // A step with only the conversation selector uses the Carbon planner.
         assert_eq!(model(3).0, "gemini-4-carbon");
 
@@ -1431,7 +1472,28 @@ mod tests {
         assert!(sync().unwrap().imported >= 1);
         assert_eq!(model(1).0, "gemini-4-carbon");
         assert_eq!(model(2).0, "gemini-4-hydrogen");
+        assert!(model(2).1.parse::<f64>().unwrap() > 0.0, "{}", model(2).1);
         assert_eq!(model(3).0, "gemini-4-carbon");
+        assert_eq!(sync().unwrap().imported, 0);
+
+        // Simulate legacy pre-fix sync cursor + misclassified unpriced "gemini-flash" worker row.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE proxy_request_logs SET model='gemini-flash', request_model='Gemini Flash', total_cost_usd='0' WHERE request_id='agy:orch:2'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE session_log_sync SET parser_state=?1",
+                [native_models::native_state_fingerprint(&transcript)],
+            )
+            .unwrap();
+        }
+        assert_eq!(sync().unwrap().imported, 1);
+        let upgraded = model(2);
+        assert_eq!(upgraded.0, "gemini-4-hydrogen");
+        assert!(upgraded.1.parse::<f64>().unwrap() > 0.0, "{}", upgraded.1);
         assert_eq!(sync().unwrap().imported, 0);
     }
 }
