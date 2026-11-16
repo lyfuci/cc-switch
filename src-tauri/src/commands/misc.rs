@@ -5911,6 +5911,10 @@ async fn switch_agy_to_bound_account(
         log::info!("[AgyAccount] 这个平台不能切号，忽略卡片绑定的账号");
         return Ok(());
     }
+    if crate::commands::tool_runs_in_wsl("agy") {
+        log::info!("[AgyAccount] Antigravity 运行在 WSL 里，忽略卡片绑定的本机账号");
+        return Ok(());
+    }
     if !accounts
         .list()
         .await
