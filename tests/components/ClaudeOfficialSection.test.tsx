@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +7,7 @@ import {
   ClaudeBoundAccountLine,
   ClaudeOfficialSection,
 } from "@/components/providers/forms/ClaudeOfficialSection";
+import { createTestQueryClient } from "../utils/testQueryClient";
 
 const mocks = vi.hoisted(() => ({
   useManagedAuth: vi.fn(),
@@ -84,11 +85,7 @@ const loginSwitch = (overrides: Record<string, unknown> = {}) => {
 // 组件读 React Query（切换状态、账号列表），每个用例一个新的 client
 const withQuery = (node: React.ReactNode) =>
   render(
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={createTestQueryClient()}>
       {node}
     </QueryClientProvider>,
   );
@@ -365,6 +362,36 @@ describe("ClaudeOfficialSection", () => {
     expect(reauth).toHaveAttribute("aria-disabled", "true");
     await userEvent.click(reauth);
     expect(auth.addAccount).not.toHaveBeenCalled();
+  });
+
+  it("adds an account inside WSL and hides quota while switching works", async () => {
+    mocks.getLoginSwitch.mockResolvedValue(loginSwitch({ wslAccounts: true }));
+    const auth = baseAuth();
+    auth.accounts = [account("work:org", "work@example.com")];
+    mocks.useManagedAuth.mockReturnValue(auth);
+    renderSection();
+
+    expect(
+      await screen.findByText(/该发行版里直接运行的 claude 会换成这个号/),
+    ).toBeInTheDocument();
+    const add = screen.getByRole("button", { name: "添加账号" });
+    expect(
+      screen.queryByText(/暂不支持添加和切换 Claude 账号/),
+    ).not.toBeInTheDocument();
+    expect(add).not.toHaveAttribute("aria-disabled", "true");
+    await userEvent.click(add);
+    expect(auth.addAccount).toHaveBeenCalled();
+    expect(screen.queryByTestId("claude-quota")).not.toBeInTheDocument();
+  });
+
+  it("explains that a WSL card switch changes the distro login", async () => {
+    mocks.getLoginSwitch.mockResolvedValue(loginSwitch({ wslAccounts: true }));
+    mocks.useManagedAuth.mockReturnValue(baseAuth());
+    renderSelect();
+    expect(
+      await screen.findByText(/会把该发行版里的 claude 换成这个号/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/不改发行版里现有的登录/)).toBeInTheDocument();
   });
 
   it("says WSL isn't supported on the card form", async () => {
