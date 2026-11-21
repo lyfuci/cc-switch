@@ -38,21 +38,25 @@ pub(crate) async fn agy_quota(
     }
     let result = match account_id {
         Some(account_id) => manager.quota(account_id).await,
+        None if crate::commands::tool_runs_in_wsl(TOOL) => {
+            return crate::services::subscription_agy::get_agy_subscription_quota().await;
+        }
         None => match manager.live_quota().await {
             Some(result) => result,
             None => return crate::services::subscription_agy::get_agy_subscription_quota().await,
         },
     };
     Ok(match result {
-        Ok(tiers) => SubscriptionQuota {
+        Ok(quota) => SubscriptionQuota {
             tool: TOOL.to_string(),
             credential_status: CredentialStatus::Valid,
             credential_message: None,
             success: true,
-            tiers,
+            tiers: quota.tiers,
             extra_usage: None,
             reset_credits: None,
             credits_balance: None,
+            plan_name: quota.plan,
             error: None,
             queried_at: Some(chrono::Utc::now().timestamp_millis()),
         },

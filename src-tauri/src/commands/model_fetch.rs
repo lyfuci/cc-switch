@@ -29,7 +29,42 @@ pub async fn get_agy_models(
     // 登录态不在 settings.json 里：首次使用、只用官方登录时它可能还不存在，列模型只依赖
     // CLI 自己。文件在但坏了照样报错，免得静默略过。
     if api_key.is_none() && crate::agy_config::settings_path().exists() {
-        crate::agy_config::read_live_settings().map_err(|e| e.to_string())?;
+        crate::agy_config::read_live_settings()?;
+    }
+    #[cfg(target_os = "windows")]
+    if crate::commands::tool_runs_in_wsl("agy") {
+        let scratch = match &api_key {
+            Some(_) => {
+                let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+                let settings = dir.path().join("antigravity-cli").join("settings.json");
+                std::fs::create_dir_all(settings.parent().unwrap()).map_err(|e| e.to_string())?;
+                std::fs::write(&settings, br#"{"modelProvider":"gemini"}"#)
+                    .map_err(|e| e.to_string())?;
+                Some(dir)
+            }
+            None => None,
+        };
+        let profile = scratch
+            .as_ref()
+            .map(|dir| dir.path().to_string_lossy().into_owned());
+        let key = api_key.clone();
+        let url = base_url.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            crate::commands::run_agy_wsl_models(
+                profile.as_deref(),
+                key.as_deref(),
+                url.as_deref(),
+                Some(std::time::Duration::from_secs(20)),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|_| "Antigravity CLI not found; install agy first".to_string())?;
+        drop(scratch);
+        if !output.status.success() {
+            return Err("Antigravity could not list models. Check the API key and endpoint, or sign in with agy for official models.".into());
+        }
+        return Ok(parse_agy_models(&String::from_utf8_lossy(&output.stdout)));
     }
     let path = tokio::task::spawn_blocking(crate::agy_config::real_agy_bin)
         .await
@@ -58,7 +93,15 @@ pub async fn get_agy_models(
             }
             Some(dir)
         }
-        None => None,
+        None => {
+            if let Some(dir) = crate::agy_config::non_default_gemini_root(
+                &crate::agy_config::agy_gemini_root(),
+                &crate::config::get_home_dir(),
+            ) {
+                command.arg(format!("--gemini_dir={}", dir.to_string_lossy()));
+            }
+            None
+        }
     };
     command.arg("models");
     let output = tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
@@ -117,7 +160,7 @@ pub async fn get_opencode_models() -> Result<Vec<OpenCodeModelRef>, String> {
             ("OPENCODE_CONFIG_DIR", config_dir_env),
             ("OPENCODE_DISABLE_PROJECT_CONFIG", "true".to_string()),
         ];
-        let output = super::misc::run_detected_tool_command_with_timeout(
+        let output = super::misc::tool_process::run_detected_tool_command_with_timeout(
             "opencode",
             &["models"],
             Some(OPENCODE_MODELS_TIMEOUT),
