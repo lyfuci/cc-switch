@@ -27,7 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: e103cc2dbd46a404c38f30b1b15ec93f00f97aa0
+          ref: 85297cd2b2e14bc513bb276374db7df224cbfa6b
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -86,7 +86,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          $VERSION = 'agy-wsl-preview-7'
+          $VERSION = 'agy-wsl-preview-8'
           $targetRoot = 'src-tauri/target/release'
           if (-not (Test-Path $targetRoot)) {
             $targetRoot = 'src-tauri/target/x86_64-pc-windows-msvc/release'
@@ -139,22 +139,19 @@ jobs:
       - name: Publish GitHub prerelease
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: agy-wsl-preview-7
-          name: Antigravity WSL preview (unsigned) — agy-wsl-preview-7
+          tag_name: agy-wsl-preview-8
+          name: Antigravity WSL preview (unsigned) — agy-wsl-preview-8
           target_commitish: ${{ github.sha }}
           prerelease: true
           make_latest: false
           body: |
-            Unsigned Windows x64 test build of `e103cc2d` (`#9430`), rebased onto upstream `v4.0.36+` (`2a750c3f`).
+            Unsigned Windows x64 test build of `85297cd2` (`build/agy-wsl-preview-8`), rebased onto upstream `v4.0.37+` (`1159383d`).
 
             Includes:
-            - Upstream Orchestrator per-generation attribution & pricing, including `gemini-4-neon`, `gemini-pro-orchestrator-neon`, and `gemini-flash-worker-agy` (`#8845`, `#9494`, `#9542`, `#9686`)
-            - Upstream Windows Antigravity Credential Manager account switching, guarded so WSL `.gemini` roots keep querying the WSL `agy` login
-            - Antigravity WSL and custom `.gemini` directory support (`#9430`) plus all review fixes:
-              - Full `WSLENV` (`/u`) isolation for paths, args, endpoints, credentials, and POSIX payloads + `bash`/`zsh`/`fish`/`dash`/`sh` login launcher
-              - WAL-only local SQLite snapshot recovery (`READ_WRITE` replay + `query_only=ON`), refusing Windows→WSL `delete_session`, and shared `path_stays_inside`
-              - Cached subagent parent lookup (`ParentLookupCache`), mode-selector filtering (`Orchestrator (*)`, `gemini-flash-worker-agy`), and `v5:` backfill
-              - Unified `DIRECTORY_APPS` / `settings::get_override_dir` / `commands/config` wiring and full React Query cache invalidation (`providers`, `skills`, `sessions`, `prompts`, `mcp`, `subscription/quota`)
+            - Merged upstream PR `#9788` (`a489233e`): Antigravity native streaming generation speed (`output_tokens / (latency_ms - first_token_ms)`) & exact TTFT (without `≈`)
+            - Merged upstream PR `#9266` (`2e2f3bbf`): Antigravity empty/internal/side-question session filtering & structured `SessionBlock`s, integrated with WSL/9P local SQLite snapshots & UNC path containment
+            - Merged upstream `v4.0.37+` fixes (`#9774` Linux Antigravity account switching, `#9512`, `#9113`, `#9017`, `#8191`, Orchestrator per-generation attribution & pricing backfill)
+            - Antigravity WSL and custom `.gemini` directory support (`#9430` `2cbf5a76`) with `WSLENV` isolation, `--gemini_dir` forwarding, cached subagent parent lookup (`ParentLookupCache`), and unified `DIRECTORY_APPS` settings wiring
 
             In Settings → 应用配置, set Antigravity's config directory to the WSL `.gemini` root, for example `\\wsl.localhost\Ubuntu-24.04\home\<user>\.gemini`. CC Switch then reads and writes that tree (settings, MCP, skills, prompts, sessions, usage) and runs agy through `wsl.exe -d <Distro>`.
 
