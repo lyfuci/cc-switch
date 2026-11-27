@@ -1,9 +1,8 @@
 //! Antigravity CLI 官方登录的剩余额度：问 agy 自己的 `/usage` 命令
-//! （`agy -p /usage --output-format json`），这条命令不调模型、不新建会话。
+//! （`agy -p /usage --output-format json`），这条命令不调模型、不新建会话，启动 agy 要七八秒。
 //!
-//! 这是后备路径：能切号的平台（macOS）先用 CC Switch 存的令牌直接问 Google
-//! （`commands::agy_account::agy_quota`，约 1 秒），认不出 agy 的登录时才走这里；
-//! 启动 agy 要七八秒。
+//! 这是唯一的查询方式：CC Switch 不拿 agy 的令牌、也不冒充 agy 的客户端标识去问 Google，
+//! 所以只能查 agy 现在登着的那个号（别的号显示切走前最后一次查到的，见 `agy_account`）。
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +15,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const TIER_AGY_GEMINI_FIVE_HOUR: &str = "agy_gemini_five_hour";
 pub const TIER_AGY_GEMINI_WEEKLY: &str = "agy_gemini_weekly";
+pub const TIER_AGY_GEMINI_ARGON_WEEKLY: &str = "agy_gemini_argon_weekly";
 pub const TIER_AGY_THIRD_PARTY_FIVE_HOUR: &str = "agy_third_party_five_hour";
 pub const TIER_AGY_THIRD_PARTY_WEEKLY: &str = "agy_third_party_weekly";
 
@@ -49,12 +49,14 @@ struct UsageBucket {
     reset_time: Option<String>,
 }
 
-/// agy 的额度分组：Gemini 一组，Claude 和 GPT 共用一组，每组各有 5 小时和每周两档。
+/// agy 的额度分组：Gemini 一组，Claude 和 GPT 共用一组，每组各有 5 小时和每周两档；
+/// Pro 档的 Gemini 组另有 Gemini 4 Argon 单独的每周额度。
 /// 不认识的桶（以后新增的组）跳过，免得显示成没有文案的档。
 fn tier_name(bucket_id: &str) -> Option<&'static str> {
     match bucket_id {
         "gemini-5h" => Some(TIER_AGY_GEMINI_FIVE_HOUR),
         "gemini-weekly" => Some(TIER_AGY_GEMINI_WEEKLY),
+        "gemini-argon-wtu-weekly" => Some(TIER_AGY_GEMINI_ARGON_WEEKLY),
         "3p-5h" => Some(TIER_AGY_THIRD_PARTY_FIVE_HOUR),
         "3p-weekly" => Some(TIER_AGY_THIRD_PARTY_WEEKLY),
         _ => None,
@@ -65,13 +67,27 @@ fn sort_order(name: &str) -> usize {
     match name {
         TIER_AGY_GEMINI_FIVE_HOUR => 0,
         TIER_AGY_GEMINI_WEEKLY => 1,
-        TIER_AGY_THIRD_PARTY_FIVE_HOUR => 2,
-        _ => 3,
+        TIER_AGY_GEMINI_ARGON_WEEKLY => 2,
+        TIER_AGY_THIRD_PARTY_FIVE_HOUR => 3,
+        _ => 4,
+    }
+}
+
+pub(crate) const USAGE_OUTPUT_SENTINEL: &str = "__CCSWITCH_AGY_USAGE__";
+
+fn after_usage_sentinel(stdout: &[u8]) -> &[u8] {
+    let needle = USAGE_OUTPUT_SENTINEL.as_bytes();
+    match stdout
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+    {
+        Some(pos) => &stdout[pos + needle.len()..],
+        None => stdout,
     }
 }
 
 fn parse_usage(stdout: &[u8]) -> Option<Vec<QuotaTier>> {
-    let output: UsageOutput = serde_json::from_slice(stdout).ok()?;
+    let output: UsageOutput = serde_json::from_slice(after_usage_sentinel(stdout)).ok()?;
     if output.status.as_deref() != Some("SUCCESS") {
         return None;
     }
@@ -85,8 +101,7 @@ fn parse_usage(stdout: &[u8]) -> Option<Vec<QuotaTier>> {
 }
 
 /// 一组额度桶（id、剩余比例、重置时间）→ 排好序的档；一档都认不出时返回 `None`。
-/// agy 的 `/usage` 和直接查 Google 额度接口（`agy_account::quota`）返回的是同一组桶。
-pub(crate) fn collect_tiers(
+fn collect_tiers(
     buckets: impl IntoIterator<Item = (Option<String>, Option<f64>, Option<String>)>,
 ) -> Option<Vec<QuotaTier>> {
     let mut tiers: Vec<QuotaTier> = buckets
@@ -113,6 +128,30 @@ pub(crate) fn collect_tiers(
 /// 由 `subscription::get_subscription_quota("agy")` 分发。没装 agy 时按「没有凭据」处理（卡片不显示）；
 /// 超时、没登录或输出看不懂都写成查询失败，错误里不带 agy 的原始输出。
 pub(crate) async fn get_agy_subscription_quota() -> Result<SubscriptionQuota, String> {
+    // 配置目录在 WSL 里时，额度属于那个发行版里已登录的 agy，不能问 Windows 上的另一份。
+    #[cfg(target_os = "windows")]
+    if crate::commands::tool_runs_in_wsl(TOOL) {
+        let output =
+            tokio::task::spawn_blocking(|| crate::commands::run_agy_wsl_usage(Some(TIMEOUT)))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+        return quota_from_usage_output(&output);
+    }
+    query_local_agy_subscription_quota(true).await
+}
+
+/// 强制查询本机 `agy` 的 `/usage`（不走 WSL 路由，也不透传非默认的 `--gemini_dir`）。
+///
+/// 供 Windows 授权中心 / 托盘在 `agyConfigDir` 指向 WSL 时仍按本机钥匙串查询本机账号额度，
+/// 避免把 WSL 里的账号额度误记到本机钥匙串账号上。
+pub(crate) async fn get_local_agy_subscription_quota() -> Result<SubscriptionQuota, String> {
+    query_local_agy_subscription_quota(false).await
+}
+
+async fn query_local_agy_subscription_quota(
+    apply_configured_root: bool,
+) -> Result<SubscriptionQuota, String> {
     let Some(bin) = tokio::task::spawn_blocking(crate::agy_config::real_agy_bin)
         .await
         .map_err(|e| e.to_string())?
@@ -120,6 +159,14 @@ pub(crate) async fn get_agy_subscription_quota() -> Result<SubscriptionQuota, St
         return Ok(SubscriptionQuota::not_found(TOOL));
     };
     let mut command = crate::agy_config::background_command(&bin);
+    if apply_configured_root {
+        if let Some(dir) = crate::agy_config::non_default_gemini_root(
+            &crate::agy_config::agy_gemini_root(),
+            &crate::config::get_home_dir(),
+        ) {
+            command.arg(format!("--gemini_dir={}", dir.to_string_lossy()));
+        }
+    }
     command
         .args(["--print", "/usage", "--output-format", "json"])
         // 只问官方登录：GUI 进程里残留的 Key 会让 agy 改走 Key 模式。
@@ -132,6 +179,10 @@ pub(crate) async fn get_agy_subscription_quota() -> Result<SubscriptionQuota, St
         Ok(Err(_)) => return Ok(SubscriptionQuota::not_found(TOOL)),
         Err(_) => return Err("Antigravity quota query timed out".to_string()),
     };
+    quota_from_usage_output(&output)
+}
+
+fn quota_from_usage_output(output: &std::process::Output) -> Result<SubscriptionQuota, String> {
     let tiers = output
         .status
         .success()
@@ -153,6 +204,7 @@ pub(crate) async fn get_agy_subscription_quota() -> Result<SubscriptionQuota, St
         extra_usage: None,
         reset_credits: None,
         credits_balance: None,
+        plan_name: None,
         error: None,
         queried_at: Some(now_millis()),
     })
@@ -176,7 +228,8 @@ mod tests {
       "command": {"name": "usage", "data": {"description": "...", "groups": [
         {"name": "Gemini Models", "buckets": [
           {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.75, "reset_time": "2026-10-27T15:13:36Z"},
-          {"id": "gemini-5h", "window": "5h", "remaining_fraction": 1, "reset_time": "2026-10-21T04:16:37Z"}
+          {"id": "gemini-5h", "window": "5h", "remaining_fraction": 1, "reset_time": "2026-10-21T04:16:37Z"},
+          {"id": "gemini-argon-wtu-weekly", "window": "weekly", "remaining_fraction": 0.8, "reset_time": "2026-10-27T18:00:00Z"}
         ]},
         {"name": "Claude and GPT models", "buckets": [
           {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 0.1, "reset_time": "2026-10-27T23:16:37Z"},
@@ -195,13 +248,15 @@ mod tests {
             [
                 TIER_AGY_GEMINI_FIVE_HOUR,
                 TIER_AGY_GEMINI_WEEKLY,
+                TIER_AGY_GEMINI_ARGON_WEEKLY,
                 TIER_AGY_THIRD_PARTY_FIVE_HOUR,
                 TIER_AGY_THIRD_PARTY_WEEKLY,
             ]
         );
         let used: Vec<_> = tiers.iter().map(|t| t.utilization.round()).collect();
-        assert_eq!(used, [0.0, 25.0, 100.0, 90.0]);
+        assert_eq!(used, [0.0, 25.0, 20.0, 100.0, 90.0]);
         assert_eq!(tiers[1].resets_at.as_deref(), Some("2026-10-27T15:13:36Z"));
+        assert_eq!(tiers[2].resets_at.as_deref(), Some("2026-10-27T18:00:00Z"));
     }
 
     #[test]
@@ -214,5 +269,31 @@ mod tests {
             br#"{"status":"SUCCESS","command":{"data":{"groups":[{"buckets":[{"id":"gemini-5h"}]}]}}}"#
         )
         .is_none());
+    }
+
+    #[test]
+    fn parses_usage_after_login_shell_startup_noise_and_sentinel() {
+        let mut noisy = Vec::new();
+        noisy.extend_from_slice(b"\x1b]0;user@host: ~\x07welcome to ubuntu\nnvm is ready\n");
+        noisy.extend_from_slice(USAGE_OUTPUT_SENTINEL.as_bytes());
+        noisy.push(b'\n');
+        noisy.extend_from_slice(SAMPLE.as_bytes());
+        assert_eq!(parse_usage(&noisy).unwrap().len(), 5);
+
+        let mut repeated = Vec::new();
+        repeated.extend_from_slice(b"banner ");
+        repeated.extend_from_slice(USAGE_OUTPUT_SENTINEL.as_bytes());
+        repeated.extend_from_slice(b"\nnot json\n");
+        repeated.extend_from_slice(USAGE_OUTPUT_SENTINEL.as_bytes());
+        repeated.push(b'\n');
+        repeated.extend_from_slice(SAMPLE.as_bytes());
+        assert_eq!(parse_usage(&repeated).unwrap().len(), 5);
+
+        let mut non_utf8 = Vec::new();
+        non_utf8.extend_from_slice(b"\xff\xfe\xfd\n");
+        non_utf8.extend_from_slice(USAGE_OUTPUT_SENTINEL.as_bytes());
+        non_utf8.push(b'\n');
+        non_utf8.extend_from_slice(SAMPLE.as_bytes());
+        assert_eq!(parse_usage(&non_utf8).unwrap().len(), 5);
     }
 }

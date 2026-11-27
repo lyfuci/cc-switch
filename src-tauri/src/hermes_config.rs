@@ -32,7 +32,7 @@
 
 use crate::config::{atomic_write, get_app_config_dir};
 use crate::error::AppError;
-use crate::settings::{effective_backup_retain_count, get_hermes_override_dir};
+use crate::settings::{effective_backup_retain_count, get_override_dir};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,13 +48,22 @@ use std::sync::{Mutex, OnceLock};
 ///
 /// 解析顺序对齐 Hermes 自身的 `get_hermes_home()`:
 ///   1. CCS 设置 `hermes_config_dir`(显式覆盖)
-///   2. `HERMES_HOME` 环境变量(trim 后非空;按原样,不展开 `~`,与 Hermes `Path(val)` 一致)
-///   3. 平台默认(Windows: `%LOCALAPPDATA%\hermes`,Mac/Linux: `~/.hermes`)
+///   2. 设了 `CC_SWITCH_TEST_HOME` 时是 `<test home>/.hermes`:测试不能读写真实的 Hermes 目录
+///      (Windows 的平台默认不在 home 下,跟着 home 覆盖走不进临时目录)
+///   3. `HERMES_HOME` 环境变量(trim 后非空;按原样,不展开 `~`,与 Hermes `Path(val)` 一致)
+///   4. 平台默认(Windows: `%LOCALAPPDATA%\hermes`,Mac/Linux: `~/.hermes`)
 pub fn get_hermes_dir() -> PathBuf {
-    if let Some(override_dir) = get_hermes_override_dir() {
+    if let Some(override_dir) = get_override_dir(&crate::app_config::AppType::Hermes) {
         return override_dir;
     }
+    if let Some(test_home) = crate::config::test_home_override() {
+        return test_home.join(".hermes");
+    }
+    hermes_dir_from_env()
+}
 
+/// 没有设置覆盖时 Hermes 自己用的目录:`HERMES_HOME`,否则平台默认。
+fn hermes_dir_from_env() -> PathBuf {
     if let Some(raw) = std::env::var_os("HERMES_HOME") {
         let value = raw.to_string_lossy();
         let trimmed = value.trim();
@@ -424,7 +433,7 @@ fn write_yaml_section_to_config(
     section_key: &str,
     value: &serde_yaml::Value,
 ) -> Result<HermesWriteOutcome, AppError> {
-    let _guard = hermes_write_lock().lock()?;
+    let _guard = crate::sync_utils::lock_file_operation(hermes_write_lock());
     write_yaml_section_to_config_locked(section_key, value)
 }
 
@@ -793,7 +802,7 @@ pub fn set_provider(
     name: &str,
     provider_config: serde_json::Value,
 ) -> Result<HermesWriteOutcome, AppError> {
-    let _guard = hermes_write_lock().lock()?;
+    let _guard = crate::sync_utils::lock_file_operation(hermes_write_lock());
 
     let config = read_hermes_config()?;
     ensure_provider_writable(&config, name, "edit")?;
@@ -872,7 +881,7 @@ pub fn remove_provider(name: &str) -> Result<HermesWriteOutcome, AppError> {
         .map(String::from);
 
     let outcome = {
-        let _guard = hermes_write_lock().lock()?;
+        let _guard = crate::sync_utils::lock_file_operation(hermes_write_lock());
         let config = read_hermes_config()?;
 
         ensure_provider_writable(&config, name, "remove")?;
@@ -1070,7 +1079,7 @@ pub fn update_mcp_servers_yaml<F>(updater: F) -> Result<(), AppError>
 where
     F: FnOnce(&mut serde_yaml::Mapping) -> Result<(), AppError>,
 {
-    let _guard = hermes_write_lock().lock()?;
+    let _guard = crate::sync_utils::lock_file_operation(hermes_write_lock());
     let config = read_hermes_config()?;
     let mut servers = config
         .get("mcp_servers")
@@ -1190,7 +1199,7 @@ impl Default for HermesMemoryLimits {
 /// `user_profile_enabled` (not `user_enabled`), so the mapping to on-disk keys
 /// lives here rather than leaking to callers.
 pub fn set_memory_enabled(kind: MemoryKind, enabled: bool) -> Result<HermesWriteOutcome, AppError> {
-    let _guard = hermes_write_lock().lock()?;
+    let _guard = crate::sync_utils::lock_file_operation(hermes_write_lock());
     let config = read_hermes_config()?;
 
     let mut memory = match config.get("memory") {
@@ -1243,14 +1252,13 @@ pub fn read_memory_limits() -> Result<HermesMemoryLimits, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_utils::MutexExt;
     use serial_test::serial;
     use std::sync::{Mutex, OnceLock};
 
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
+        LOCK.get_or_init(|| Mutex::new(())).lock_recover()
     }
 
     /// Run a test with an isolated temp home directory.
@@ -1260,28 +1268,9 @@ mod tests {
     fn with_test_home<T>(test_fn: impl FnOnce() -> T) -> T {
         let _guard = test_guard();
         let tmp = tempfile::tempdir().unwrap();
-        let old_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
-        std::env::set_var("CC_SWITCH_TEST_HOME", tmp.path());
-        // Neutralize the env vars get_hermes_dir() consults, so an ambient
-        // HERMES_HOME / LOCALAPPDATA (e.g. set by a Hermes install) can't make
-        // tests escape the temp home. Restored below.
-        let old_hermes_home = std::env::var_os("HERMES_HOME");
-        let old_local_appdata = std::env::var_os("LOCALAPPDATA");
-        std::env::remove_var("HERMES_HOME");
-        std::env::remove_var("LOCALAPPDATA");
+        let env = crate::test_support::EnvVars::new().set("CC_SWITCH_TEST_HOME", tmp.path());
         let result = test_fn();
-        match old_local_appdata {
-            Some(value) => std::env::set_var("LOCALAPPDATA", value),
-            None => std::env::remove_var("LOCALAPPDATA"),
-        }
-        match old_hermes_home {
-            Some(value) => std::env::set_var("HERMES_HOME", value),
-            None => std::env::remove_var("HERMES_HOME"),
-        }
-        match old_test_home {
-            Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
-            None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
-        }
+        drop(env);
         result
     }
 
@@ -2478,7 +2467,7 @@ user_profile_enabled: false
             let custom = std::env::temp_dir().join("ccs-hermes-home-precedence");
             std::env::set_var("HERMES_HOME", &custom);
 
-            let dir = get_hermes_dir();
+            let dir = hermes_dir_from_env();
 
             match old {
                 Some(v) => std::env::set_var("HERMES_HOME", v),
@@ -2534,7 +2523,7 @@ user_profile_enabled: false
             let old = std::env::var_os("HERMES_HOME");
             std::env::set_var("HERMES_HOME", "   ");
 
-            let dir = get_hermes_dir();
+            let dir = hermes_dir_from_env();
 
             match old {
                 Some(v) => std::env::set_var("HERMES_HOME", v),
@@ -2559,7 +2548,7 @@ user_profile_enabled: false
             let old = std::env::var_os("HERMES_HOME");
             std::env::remove_var("HERMES_HOME");
 
-            let dir = get_hermes_dir();
+            let dir = hermes_dir_from_env();
 
             if let Some(v) = old {
                 std::env::set_var("HERMES_HOME", v);
@@ -2620,40 +2609,23 @@ user_profile_enabled: false
         );
     }
 
+    /// A test home must keep every Hermes path inside it, whatever HERMES_HOME
+    /// or the platform default (`%LOCALAPPDATA%\hermes` on Windows) says; otherwise
+    /// a test run writes into the real Hermes config and the next run reads it back.
     #[test]
     #[serial]
-    fn with_test_home_neutralizes_hermes_env_vars() {
-        // An ambient HERMES_HOME / LOCALAPPDATA (e.g. set by a Hermes install)
-        // must not leak into the test home — otherwise other tests in this
-        // module would read/write a real Hermes config via get_hermes_config_path().
-        let saved_hh = std::env::var_os("HERMES_HOME");
-        let saved_la = std::env::var_os("LOCALAPPDATA");
-        std::env::set_var("HERMES_HOME", "/ambient/hermes-home");
-        std::env::set_var("LOCALAPPDATA", "/ambient/local-appdata");
+    fn test_home_keeps_hermes_inside_it() {
+        with_test_home(|| {
+            let mut s = crate::settings::get_settings();
+            s.hermes_config_dir = None;
+            crate::settings::update_settings(s).unwrap();
+            let _env = crate::test_support::EnvVars::new()
+                .set("HERMES_HOME", "/ambient/hermes-home")
+                .set("LOCALAPPDATA", "/ambient/local-appdata");
 
-        let inside = with_test_home(|| {
-            (
-                std::env::var_os("HERMES_HOME"),
-                std::env::var_os("LOCALAPPDATA"),
-            )
+            let home = crate::config::test_home_override().unwrap();
+            assert_eq!(get_hermes_dir(), home.join(".hermes"));
+            assert!(get_hermes_config_path().starts_with(&home));
         });
-
-        match saved_hh {
-            Some(v) => std::env::set_var("HERMES_HOME", v),
-            None => std::env::remove_var("HERMES_HOME"),
-        }
-        match saved_la {
-            Some(v) => std::env::set_var("LOCALAPPDATA", v),
-            None => std::env::remove_var("LOCALAPPDATA"),
-        }
-
-        assert_eq!(
-            inside.0, None,
-            "with_test_home must clear ambient HERMES_HOME"
-        );
-        assert_eq!(
-            inside.1, None,
-            "with_test_home must clear ambient LOCALAPPDATA"
-        );
     }
 }

@@ -48,6 +48,7 @@ import { sessionMenuItemClass } from "../SessionItem";
 import {
   buildCdResumeCommand,
   canDeleteSession,
+  nativeDeleteHintKey,
   formatClock,
   formatShortDateTime,
   isSessionAppId,
@@ -112,6 +113,8 @@ export const SessionReaderHeader = memo(function SessionReaderHeader({
   const isCodex = session.providerId === "codex";
   const command = session.resumeCommand;
   const deletable = canDeleteSession(session);
+  // 只能在原软件里删的会话：说明去哪里删（与列表项的提示同一来源）
+  const deleteHintKey = nativeDeleteHintKey(session);
 
   const launchLabel = launchTerminal
     ? t("sessionManager.resumeIn", {
@@ -350,16 +353,9 @@ export const SessionReaderHeader = memo(function SessionReaderHeader({
         >
           {t("sessionManager.deleteEllipsis", { defaultValue: "删除…" })}
         </DropdownMenuItem>
-        {!deletable && ["mcode", "dsh"].includes(session.providerId) && (
+        {!deletable && deleteHintKey && (
           <p className="px-2.5 pb-1.5 text-caption text-fg-2">
-            {t(
-              session.providerId === "dsh"
-                ? "dsh.deleteSessionHint"
-                : "sessionManager.mcodeDeleteHint",
-              {
-                defaultValue: "请在 MiniMax Code 中删除",
-              },
-            )}
+            {t(deleteHintKey)}
           </p>
         )}
       </DropdownMenuContent>
@@ -725,6 +721,8 @@ export const SessionReaderToolbar = memo(function SessionReaderToolbar({
                 })}
                 autoComplete="off"
                 spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
                 className={cn(fieldClass, "h-7 pe-2 ps-7 text-caption")}
               />
             </div>

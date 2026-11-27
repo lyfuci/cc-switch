@@ -9,7 +9,6 @@ import {
 const OPENCODE_GO_CODEX_TOML = `model_provider = "custom"
 model = "glm-5.2"
 model_reasoning_effort = "high"
-disable_response_storage = true
 
 [model_providers.custom]
 name = "opencode_go"
@@ -40,6 +39,41 @@ describe("detectCodingPlanProvider (OpenCode Go)", () => {
     expect(
       detectCodingPlanProvider("https://opencode.ai/inference/v1"),
     ).toBeNull();
+  });
+});
+
+describe("detectCodingPlanProvider (Ollama Cloud)", () => {
+  it.each([
+    "https://ollama.com",
+    "https://ollama.com/v1",
+    "https://OLLAMA.com/",
+  ])("recognizes Ollama Cloud for %s", (baseUrl) => {
+    expect(detectCodingPlanProvider(baseUrl)).toBe("ollama_cloud");
+  });
+
+  it.each([
+    "http://localhost:11434",
+    "http://127.0.0.1:11434/v1",
+    "https://ollama.com.example.com/v1",
+    "https://proxy.example.com/ollama.com/v1",
+  ])("ignores local Ollama and look-alike hosts such as %s", (baseUrl) => {
+    expect(detectCodingPlanProvider(baseUrl)).toBeNull();
+  });
+});
+
+describe("detectCodingPlanProvider (Xiaomi MiMo)", () => {
+  it.each([
+    "https://token-plan-cn.xiaomimimo.com/anthropic",
+    "https://token-plan-cn.xiaomimimo.com/v1",
+  ])("recognizes the MiMo Token Plan for %s", (baseUrl) => {
+    expect(detectCodingPlanProvider(baseUrl)).toBe("mimo");
+  });
+
+  it.each([
+    "https://api.xiaomimimo.com/anthropic",
+    "https://relay.example.com/token-plan-cn.xiaomimimo.com/v1",
+  ])("ignores pay-as-you-go and relay URLs such as %s", (baseUrl) => {
+    expect(detectCodingPlanProvider(baseUrl)).toBeNull();
   });
 });
 
@@ -137,6 +171,30 @@ type TestProvider = {
   settingsConfig?: Record<string, any>;
   meta?: Record<string, any>;
 };
+
+describe("options.baseURL apps", () => {
+  it("reads DeepSeek Harness and ZCode cards like OpenCode", () => {
+    for (const appId of ["dsh", "zcode"]) {
+      expect(
+        extractBaseUrlForUsageDetection(appId, {
+          options: { baseURL: "https://open.bigmodel.cn/api/anthropic" },
+        }),
+      ).toBe("https://open.bigmodel.cn/api/anthropic");
+    }
+    // ZCode 是智谱的客户端：GLM Coding Plan 卡新建时就要自动开额度
+    const zcode = injectCodingPlanUsageScript("zcode", {
+      settingsConfig: {
+        kind: "anthropic",
+        options: { baseURL: "https://open.bigmodel.cn/api/anthropic" },
+      },
+    }) as TestProvider;
+    expect(zcode.meta?.usage_script).toMatchObject({
+      enabled: true,
+      templateType: "token_plan",
+      codingPlanProvider: "zhipu",
+    });
+  });
+});
 
 describe("injectCodingPlanUsageScript", () => {
   const inject = (appId: string, provider: TestProvider) =>

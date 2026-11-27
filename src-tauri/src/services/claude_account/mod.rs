@@ -19,6 +19,7 @@ pub mod shared;
 pub mod snapshot;
 pub mod usage;
 
+use crate::sync_utils::MutexExt;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -141,9 +142,7 @@ pub struct ClaudeAccountManager {
 static STORE_FILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn store_file_guard() -> std::sync::MutexGuard<'static, ()> {
-    STORE_FILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    STORE_FILE.lock_recover()
 }
 
 fn persist_store(data_dir: &Path, store: &StoreFile) -> Result<(), AppError> {
@@ -157,18 +156,7 @@ fn persist_store(data_dir: &Path, store: &StoreFile) -> Result<(), AppError> {
 }
 
 fn load_store(data_dir: &Path) -> StoreFile {
-    let path = data_dir.join(STORE_FILENAME);
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-            log::warn!("[ClaudeAccount] 账号文件解析失败，按空表处理: {error}");
-            StoreFile::default()
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => StoreFile::default(),
-        Err(error) => {
-            log::warn!("[ClaudeAccount] 账号文件读取失败，按空表处理: {error}");
-            StoreFile::default()
-        }
-    }
+    crate::config::load_json_or_set_aside(&data_dir.join(STORE_FILENAME), "ClaudeAccount")
 }
 
 /// 同步一个账号目录的共享层（见 [`shared`]）。失败只记日志：共享不上不该挡住用号。
@@ -339,9 +327,7 @@ impl ClaudeAccountManager {
     }
 
     fn ended_flows(&self) -> std::sync::MutexGuard<'_, HashMap<String, FlowEnd>> {
-        self.ended
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.ended.lock_recover()
     }
 
     /// 登录进程结束之后：成功就读身份、收录账号；失败就删掉目录。
@@ -532,23 +518,6 @@ impl ClaudeAccountManager {
             self.discard_dir(&data.local_id).await;
         }
         Ok(removed.into_iter().map(|(key, _)| key).collect())
-    }
-
-    /// 账号在本机的 `CLAUDE_CONFIG_DIR`；不在这台电脑上（别的设备同步来的绑定、已删除）为 `None`。
-    pub async fn config_dir_of(&self, account_id: &str) -> Option<PathBuf> {
-        // 拿着锁读盘：和正在进行的改动串行
-        let _store = self.store.lock().await;
-        config_dir_on_disk(&self.data_dir, account_id)
-    }
-
-    /// 本机全部账号目录（不管存不存在）：判断 live 里的 `CLAUDE_CONFIG_DIR` 是不是 CC Switch 写的。
-    pub async fn all_config_dirs(&self) -> Vec<PathBuf> {
-        load_store(&self.data_dir)
-            .accounts
-            .values()
-            .filter(|data| layout::valid_local_id(&data.local_id))
-            .map(|data| layout::config_dir(&self.data_dir, &data.local_id))
-            .collect()
     }
 
     pub fn data_dir(&self) -> &Path {

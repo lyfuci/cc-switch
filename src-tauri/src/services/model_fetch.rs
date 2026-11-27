@@ -36,6 +36,32 @@ struct ModelsResponse {
 struct ModelEntry {
     id: String,
     owned_by: Option<String>,
+    /// new-api 系中转站给每个模型标的接口类型，主类型排第一位，如
+    /// `["image-generation", "gemini", "openai"]`。收成 `Value`：形状对不上时
+    /// 只当没有这个字段，不连累整个响应解析失败（同 #7593）。
+    #[serde(default)]
+    supported_endpoint_types: Option<serde_json::Value>,
+}
+
+/// new-api 的非对话接口类型：图片、视频、向量、重排。
+const NON_CHAT_ENDPOINT_TYPES: &[&str] = &[
+    "image-generation",
+    "openai-video",
+    "embeddings",
+    "jina-rerank",
+];
+
+/// 主接口类型（第一位）是图片 / 视频 / 向量 / 重排的模型选进编程客户端只会
+/// 每条消息都失败（#10026），获取模型列表时直接滤掉。没有这个字段、形状不对、
+/// 或主类型不认识的一律保留，不改变其他供应商的行为。
+fn is_non_chat_model(entry: &ModelEntry) -> bool {
+    let Some(serde_json::Value::Array(types)) = &entry.supported_endpoint_types else {
+        return false;
+    };
+    types
+        .first()
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| NON_CHAT_ENDPOINT_TYPES.contains(&t))
 }
 
 /// `models[]` 条目对应的模型 id：`slug` 优先，回退 OpenAI 风格的 `id`；
@@ -104,7 +130,9 @@ pub async fn fetch_models(
             .strip_suffix("/v1beta")
             .or_else(|| base.strip_suffix("/v1"))
             .unwrap_or(base);
-        vec![format!("{base}/v1beta/models")]
+        // 默认每页只回 50 个（Gemini / Gemma / Imagen / Veo 加起来早已超出），
+        // 这里不翻页，直接要最大页。
+        vec![format!("{base}/v1beta/models?pageSize=1000")]
     } else {
         build_models_url_candidates(base_url, is_full_url, models_url_override)?
     };
@@ -142,6 +170,7 @@ pub async fn fetch_models(
 
             let mut models: Vec<FetchedModel> = if let Some(data) = resp.data {
                 data.into_iter()
+                    .filter(|m| !is_non_chat_model(m))
                     .map(|m| FetchedModel {
                         id: m.id,
                         owned_by: m.owned_by,
@@ -242,6 +271,13 @@ fn build_model_fetch_headers(
             headers.insert(name, value);
         }
     }
+
+    // 兜底 User-Agent：reqwest 默认不发 UA，而前置 Cloudflare/WAF 的端点对
+    // 无 UA 请求一律 403，且会被前端误读成「API Key 无效」（#7427）。
+    // 供应商自定义 UA 与请求头里的 UA 都在上面 insert 过，优先级高于兜底。
+    headers
+        .entry(USER_AGENT)
+        .or_insert_with(|| HeaderValue::from_static("cc-switch"));
 
     Ok(headers)
 }
@@ -381,6 +417,33 @@ mod tests {
         let openai =
             build_model_fetch_headers("openai-key", Some("openai-responses"), None, None).unwrap();
         assert_eq!(openai[AUTHORIZATION], "Bearer openai-key");
+    }
+
+    #[test]
+    fn model_fetch_headers_default_user_agent_when_unset() {
+        // #7427：无 User-Agent 的请求会被前置 Cloudflare/WAF 的端点一律 403，
+        // 且被前端误读成「API Key 无效」。未配置任何 UA 时补默认值。
+        let headers = build_model_fetch_headers("key", None, None, None).unwrap();
+        assert_eq!(headers[USER_AGENT], "cc-switch");
+
+        // 纯请求头鉴权（无 api_key）同样要带默认 UA。
+        let header_only = BTreeMap::from([("Authorization".to_string(), "Token x".to_string())]);
+        let headers = build_model_fetch_headers("", None, None, Some(&header_only)).unwrap();
+        assert_eq!(headers[USER_AGENT], "cc-switch");
+    }
+
+    #[test]
+    fn model_fetch_headers_keep_explicit_user_agent_priority() {
+        // 供应商自定义 UA 优先于默认值；请求头里的 UA 优先于两者。
+        let custom = HeaderValue::from_str("my-agent/1.0").unwrap();
+        let headers = build_model_fetch_headers("key", None, Some(&custom), None).unwrap();
+        assert_eq!(headers[USER_AGENT], "my-agent/1.0");
+
+        let request_headers =
+            BTreeMap::from([("User-Agent".to_string(), "header-agent/2.0".to_string())]);
+        let headers =
+            build_model_fetch_headers("key", None, Some(&custom), Some(&request_headers)).unwrap();
+        assert_eq!(headers[USER_AGENT], "header-agent/2.0");
     }
 
     #[test]
@@ -679,6 +742,39 @@ mod tests {
         let data = resp.data.unwrap();
         assert_eq!(data[0].id, "my-model");
         assert!(data[0].owned_by.is_none());
+    }
+
+    #[test]
+    fn test_non_chat_models_filtered_by_endpoint_types() {
+        // #10026：new-api 系中转站用 supported_endpoint_types 标主接口类型。
+        let json = r#"{"data":[
+            {"id":"deepseek-flash","supported_endpoint_types":["openai"]},
+            {"id":"gemini-nano-banana-2.1","supported_endpoint_types":["image-generation","gemini","openai"]},
+            {"id":"dreamina-seedance-2-5-260628","supported_endpoint_types":["openai-video"]},
+            {"id":"text-embedding-3-small","supported_endpoint_types":["embeddings"]},
+            {"id":"claude-sonnet","supported_endpoint_types":["anthropic","openai"]},
+            {"id":"plain-model"},
+            {"id":"empty-types","supported_endpoint_types":[]},
+            {"id":"odd-shape","supported_endpoint_types":"image-generation"}
+        ]}"#;
+        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
+        let kept: Vec<String> = resp
+            .data
+            .unwrap()
+            .into_iter()
+            .filter(|m| !is_non_chat_model(m))
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                "deepseek-flash",
+                "claude-sonnet",
+                "plain-model",
+                "empty-types",
+                "odd-shape"
+            ]
+        );
     }
 
     #[test]

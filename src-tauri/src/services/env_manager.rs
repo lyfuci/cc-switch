@@ -22,8 +22,21 @@ pub fn delete_env_vars(conflicts: Vec<EnvConflict>) -> Result<BackupInfo, String
     // Step 1: Create backup
     let backup_info = create_backup(&conflicts)?;
 
-    // Step 2: Delete variables
-    for conflict in &conflicts {
+    // Step 2: Delete variables. File rows go bottom-up, so removing one line does not
+    // shift the line numbers of the rows still to come.
+    #[cfg(target_os = "windows")]
+    let ordered: Vec<&EnvConflict> = conflicts.iter().collect();
+    #[cfg(not(target_os = "windows"))]
+    let ordered = {
+        let mut ordered: Vec<&EnvConflict> = conflicts.iter().collect();
+        ordered.sort_by_key(|conflict| {
+            std::cmp::Reverse(
+                parse_file_source_path(&conflict.source_path).map_or(0, |(_, line)| line),
+            )
+        });
+        ordered
+    };
+    for conflict in ordered {
         match delete_single_env(conflict) {
             Ok(_) => {}
             Err(e) => {
@@ -42,7 +55,7 @@ pub fn delete_env_vars(conflicts: Vec<EnvConflict>) -> Result<BackupInfo, String
 /// Create backup file before deletion
 fn create_backup(conflicts: &[EnvConflict]) -> Result<BackupInfo, String> {
     // Get backup directory
-    let backup_dir = backup_dir()?;
+    let backup_dir = backup_dir();
     fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
 
     // Generate backup file name with timestamp
@@ -66,9 +79,10 @@ fn create_backup(conflicts: &[EnvConflict]) -> Result<BackupInfo, String> {
 }
 
 /// Get backup directory path
-pub(crate) fn backup_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
-    Ok(home.join(".cc-switch").join("backups"))
+pub(crate) fn backup_dir() -> PathBuf {
+    crate::config::get_home_dir()
+        .join(".cc-switch")
+        .join("backups")
 }
 
 /// Delete a single environment variable
@@ -102,41 +116,57 @@ fn delete_single_env(conflict: &EnvConflict) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "windows"))]
+fn parse_file_source_path(source_path: &str) -> Result<(&str, usize), String> {
+    let (file_path, line_num) = source_path
+        .rsplit_once(':')
+        .ok_or_else(|| "无效的文件路径格式".to_string())?;
+
+    if file_path.is_empty() {
+        return Err("无效的文件路径格式".to_string());
+    }
+
+    let line_num = line_num
+        .parse::<usize>()
+        .map_err(|_| "无效的文件路径格式".to_string())?;
+
+    Ok((file_path, line_num))
+}
+
+#[cfg(not(target_os = "windows"))]
 fn delete_single_env(conflict: &EnvConflict) -> Result<(), String> {
     match conflict.source_type.as_str() {
         "file" => {
             // Parse file path and line number from source_path (format: "path:line")
-            let parts: Vec<&str> = conflict.source_path.split(':').collect();
-            if parts.len() < 2 {
-                return Err("无效的文件路径格式".to_string());
-            }
-
-            let file_path = parts[0];
+            let (file_path, line_num) = parse_file_source_path(&conflict.source_path)?;
 
             // Read file content
             let content = fs::read_to_string(file_path)
                 .map_err(|e| format!("读取文件失败 {file_path}: {e}"))?;
 
-            // Filter out the line containing the environment variable
-            let new_content: Vec<String> = content
-                .lines()
-                .filter(|line| {
-                    let trimmed = line.trim();
-                    let export_line = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-
-                    // Check if this line sets the target variable
-                    if let Some(eq_pos) = export_line.find('=') {
-                        let var_name = export_line[..eq_pos].trim();
-                        var_name != conflict.var_name
-                    } else {
-                        true
-                    }
-                })
-                .map(|s| s.to_string())
-                .collect();
+            // Remove only the listed line. Each kept line carries its own line ending, so
+            // the file's final newline and CRLF endings stay as they are.
+            let mut lines: Vec<&str> = content.split_inclusive('\n').collect();
+            let sets_var = |line: &str| {
+                let trimmed = line.trim();
+                let export_line = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+                export_line
+                    .find('=')
+                    .is_some_and(|eq_pos| export_line[..eq_pos].trim() == conflict.var_name)
+            };
+            // A line that no longer sets the variable means the file changed since the scan.
+            let index = line_num
+                .checked_sub(1)
+                .filter(|&index| lines.get(index).is_some_and(|line| sets_var(line)))
+                .ok_or_else(|| {
+                    format!(
+                        "{file_path} 第 {line_num} 行已不再设置 {}，文件可能已被修改，请重新检测",
+                        conflict.var_name
+                    )
+                })?;
+            lines.remove(index);
 
             // Write back to file
-            fs::write(file_path, new_content.join("\n"))
+            fs::write(file_path, lines.concat())
                 .map_err(|e| format!("写入文件失败 {file_path}: {e}"))?;
 
             Ok(())
@@ -149,92 +179,145 @@ fn delete_single_env(conflict: &EnvConflict) -> Result<(), String> {
     }
 }
 
-/// Restore environment variables from backup
-pub fn restore_from_backup(backup_path: String) -> Result<(), String> {
-    // Read backup file
-    let content = fs::read_to_string(&backup_path).map_err(|e| format!("读取备份文件失败: {e}"))?;
-
-    let backup_info: BackupInfo =
-        serde_json::from_str(&content).map_err(|e| format!("解析备份文件失败: {e}"))?;
-
-    // Restore each variable
-    for conflict in &backup_info.conflicts {
-        restore_single_env(conflict)?;
-    }
-
-    Ok(())
-}
-
-/// Restore a single environment variable
-#[cfg(target_os = "windows")]
-fn restore_single_env(conflict: &EnvConflict) -> Result<(), String> {
-    match conflict.source_type.as_str() {
-        "system" => {
-            if conflict.source_path.contains("HKEY_CURRENT_USER") {
-                let (hkcu, _) = RegKey::predef(HKEY_CURRENT_USER)
-                    .create_subkey("Environment")
-                    .map_err(|e| format!("打开注册表失败: {}", e))?;
-
-                hkcu.set_value(&conflict.var_name, &conflict.var_value)
-                    .map_err(|e| format!("恢复注册表项失败: {}", e))?;
-            } else if conflict.source_path.contains("HKEY_LOCAL_MACHINE") {
-                let (hklm, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
-                    .create_subkey(
-                        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
-                    )
-                    .map_err(|e| format!("打开系统注册表失败 (需要管理员权限): {}", e))?;
-
-                hklm.set_value(&conflict.var_name, &conflict.var_value)
-                    .map_err(|e| format!("恢复系统注册表项失败: {}", e))?;
-            }
-            Ok(())
-        }
-        _ => Err(format!(
-            "无法恢复类型为 {} 的环境变量",
-            conflict.source_type
-        )),
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn restore_single_env(conflict: &EnvConflict) -> Result<(), String> {
-    match conflict.source_type.as_str() {
-        "file" => {
-            // Parse file path from source_path
-            let parts: Vec<&str> = conflict.source_path.split(':').collect();
-            if parts.is_empty() {
-                return Err("无效的文件路径格式".to_string());
-            }
-
-            let file_path = parts[0];
-
-            // Read file content
-            let mut content = fs::read_to_string(file_path)
-                .map_err(|e| format!("读取文件失败 {file_path}: {e}"))?;
-
-            // Append the environment variable line
-            let export_line = format!("\nexport {}={}", conflict.var_name, conflict.var_value);
-            content.push_str(&export_line);
-
-            // Write back to file
-            fs::write(file_path, content).map_err(|e| format!("写入文件失败 {file_path}: {e}"))?;
-
-            Ok(())
-        }
-        _ => Err(format!(
-            "无法恢复类型为 {} 的环境变量",
-            conflict.source_type
-        )),
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "windows"))]
+    use tempfile::tempdir;
+
+    #[cfg(not(target_os = "windows"))]
     #[test]
-    fn test_backup_dir_creation() {
-        let backup_dir = backup_dir();
-        assert!(backup_dir.is_ok());
+    fn file_source_path_parser_preserves_colons_in_path() {
+        assert_eq!(
+            parse_file_source_path("/tmp/cc:test/.zshrc:8"),
+            Ok(("/tmp/cc:test/.zshrc", 8))
+        );
+        assert!(parse_file_source_path("/tmp/.zshrc:not-a-line").is_err());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn delete_file_env_with_colon_in_path() {
+        let temp = tempdir().expect("create temp directory");
+        let colon_dir = temp.path().join("foo:bar");
+        fs::create_dir(&colon_dir).expect("create colon directory");
+        let file_path = colon_dir.join(".zshrc");
+        fs::write(&file_path, "export OPENAI_API_KEY=original\n").expect("write shell config");
+
+        let conflict = EnvConflict {
+            var_name: "OPENAI_API_KEY".to_string(),
+            var_value: "original".to_string(),
+            source_type: "file".to_string(),
+            source_path: format!("{}:1", file_path.display()),
+        };
+
+        delete_single_env(&conflict).expect("delete variable from shell config");
+        let deleted = fs::read_to_string(&file_path).expect("read updated shell config");
+        assert!(!deleted.contains("OPENAI_API_KEY"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn delete_file_env_keeps_the_other_lines_and_their_endings() {
+        let temp = tempdir().expect("create temp directory");
+        let file_path = temp.path().join(".zshrc");
+
+        for (before, after) in [
+            (
+                "export OPENAI_API_KEY=original\nexport EDITOR=vim\nalias ll='ls -l'\n",
+                "export EDITOR=vim\nalias ll='ls -l'\n",
+            ),
+            (
+                "export OPENAI_API_KEY=original\r\nexport EDITOR=vim\r\n",
+                "export EDITOR=vim\r\n",
+            ),
+            (
+                "export OPENAI_API_KEY=original\nexport EDITOR=vim",
+                "export EDITOR=vim",
+            ),
+        ] {
+            fs::write(&file_path, before).expect("write shell config");
+            let conflict = EnvConflict {
+                var_name: "OPENAI_API_KEY".to_string(),
+                var_value: "original".to_string(),
+                source_type: "file".to_string(),
+                source_path: format!("{}:1", file_path.display()),
+            };
+
+            delete_single_env(&conflict).expect("delete variable from shell config");
+            assert_eq!(
+                fs::read_to_string(&file_path).expect("read updated shell config"),
+                after
+            );
+        }
+    }
+
+    fn file_conflict(path: &std::path::Path, var_name: &str, line: usize) -> EnvConflict {
+        EnvConflict {
+            var_name: var_name.to_string(),
+            var_value: String::new(),
+            source_type: "file".to_string(),
+            source_path: format!("{}:{line}", path.display()),
+        }
+    }
+
+    /// The banner lists one row per `file:line`; deleting a row removes that line only,
+    /// even when another line sets the same variable.
+    #[test]
+    #[serial_test::serial]
+    fn deleting_a_selected_line_keeps_other_lines_setting_the_same_variable() {
+        let home = crate::test_support::TempUserHome::new();
+        let rc = home.path().join(".zshrc");
+        fs::write(
+            &rc,
+            "export OPENAI_API_KEY=first\nif true; then\n  export OPENAI_API_KEY=second\nfi\n",
+        )
+        .unwrap();
+
+        delete_env_vars(vec![file_conflict(&rc, "OPENAI_API_KEY", 1)]).expect("delete");
+
+        assert_eq!(
+            fs::read_to_string(&rc).unwrap(),
+            "if true; then\n  export OPENAI_API_KEY=second\nfi\n"
+        );
+    }
+
+    /// Several rows of one file are removed exactly, whatever order they arrive in.
+    #[test]
+    #[serial_test::serial]
+    fn deleting_several_lines_of_one_file_removes_exactly_those_lines() {
+        let home = crate::test_support::TempUserHome::new();
+        let rc = home.path().join(".zshrc");
+        fs::write(
+            &rc,
+            "export OPENAI_API_KEY=a\nexport KEEP=1\nexport OPENAI_BASE_URL=b\nexport KEEP2=2\n",
+        )
+        .unwrap();
+
+        delete_env_vars(vec![
+            file_conflict(&rc, "OPENAI_API_KEY", 1),
+            file_conflict(&rc, "OPENAI_BASE_URL", 3),
+        ])
+        .expect("delete");
+
+        assert_eq!(
+            fs::read_to_string(&rc).unwrap(),
+            "export KEEP=1\nexport KEEP2=2\n"
+        );
+    }
+
+    /// If the file changed after the scan, the listed line no longer sets the
+    /// variable: refuse instead of deleting some other line.
+    #[test]
+    #[serial_test::serial]
+    fn a_line_that_no_longer_sets_the_variable_is_not_deleted() {
+        let home = crate::test_support::TempUserHome::new();
+        let rc = home.path().join(".zshrc");
+        let original = "export KEEP=1\nexport OPENAI_API_KEY=a\n";
+        fs::write(&rc, original).unwrap();
+
+        assert!(delete_env_vars(vec![file_conflict(&rc, "OPENAI_API_KEY", 1)]).is_err());
+        assert_eq!(fs::read_to_string(&rc).unwrap(), original);
     }
 }

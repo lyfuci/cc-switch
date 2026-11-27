@@ -241,8 +241,25 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
     session_id: Option<String>,
     tool_schema_hints: Option<AnthropicToolSchemaHints>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    convert_gemini_stream(
+        stream,
+        shadow_store,
+        provider_id,
+        session_id,
+        tool_schema_hints,
+        SseBuffer::new(),
+    )
+}
+
+fn convert_gemini_stream<E: std::error::Error + Send + 'static>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    shadow_store: Option<Arc<GeminiShadowStore>>,
+    provider_id: Option<String>,
+    session_id: Option<String>,
+    tool_schema_hints: Option<AnthropicToolSchemaHints>,
+    mut sse: SseBuffer,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
-        let mut sse = SseBuffer::new();
         let mut message_id: Option<String> = None;
         let mut current_model: Option<String> = None;
         let mut has_sent_message_start = false;
@@ -260,7 +277,10 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    sse.push_bytes(&bytes);
+                    if let Err(error) = sse.try_push_bytes(&bytes) {
+                        yield Err(error);
+                        return;
+                    }
 
                     while let Some(block) = sse.next_block() {
                         if block.trim().is_empty() {
@@ -300,8 +320,13 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
                                 .and_then(|value| value.as_str())
                                 .map(ToString::to_string);
                         }
-                        if latest_usage.is_none() {
-                            latest_usage = chunk_json.get("usageMetadata").cloned();
+                        // usageMetadata 每帧都是整次请求的快照，结尾可能单独来一帧只带 usage、
+                        // candidates 为空（缓存命中数常只在这帧给出），所以不能只在有 candidate 时更新。
+                        if let Some(usage) = chunk_json
+                            .get("usageMetadata")
+                            .filter(|value| value.is_object())
+                        {
+                            latest_usage = Some(usage.clone());
                         }
 
                         if !has_sent_message_start {
@@ -334,9 +359,6 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
                         {
                             if let Some(reason) = candidate.get("finishReason").and_then(|value| value.as_str()) {
                                 latest_finish_reason = Some(reason.to_string());
-                            }
-                            if let Some(usage) = chunk_json.get("usageMetadata") {
-                                latest_usage = Some(usage.clone());
                             }
                             if let Some(parts) = candidate
                                 .get("content")
@@ -629,6 +651,33 @@ mod tests {
     }
 
     #[test]
+    fn stops_on_oversized_sse_before_polling_upstream_again() {
+        let prefix = [b'x'; 32];
+        let stream = futures::stream::iter([
+            Bytes::from_static(b"data: "),
+            Bytes::copy_from_slice(&prefix),
+        ])
+        .map(Ok::<_, std::io::Error>)
+        .chain(futures::stream::poll_fn(|_| {
+            panic!("polled past the event limit")
+        }));
+        let converted = convert_gemini_stream(
+            stream,
+            None,
+            None,
+            None,
+            None,
+            SseBuffer::with_max_pending_bytes(32),
+        );
+        futures::executor::block_on(async {
+            futures::pin_mut!(converted);
+            let error = converted.next().await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(converted.next().await.is_none());
+        });
+    }
+
+    #[test]
     fn converts_text_stream_to_anthropic_sse() {
         let output = collect_stream_output(vec![
             "data: {\"responseId\":\"resp_1\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"totalTokenCount\":13}}\n\n",
@@ -641,6 +690,25 @@ mod tests {
         assert!(output.contains("\"text\":\"lo\""));
         assert!(output.contains("\"stop_reason\":\"end_turn\""));
         assert!(output.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn usage_only_terminal_frame_updates_final_usage() {
+        let output = collect_stream_output(vec![
+            "data: {\"responseId\":\"resp_u\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"OK\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10000,\"totalTokenCount\":10001}}\n\n",
+            "data: {\"responseId\":\"resp_u\",\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n",
+            "data: {\"responseId\":\"resp_u\",\"candidates\":[],\"usageMetadata\":{\"promptTokenCount\":12000,\"cachedContentTokenCount\":11000,\"totalTokenCount\":12010}}\n\n",
+        ]);
+
+        let delta = output
+            .split("\n\n")
+            .find(|block| block.starts_with("event: message_delta"))
+            .and_then(|block| block.lines().find_map(|line| line.strip_prefix("data: ")))
+            .map(|data| serde_json::from_str::<Value>(data).unwrap())
+            .expect("message_delta event");
+        assert_eq!(delta["usage"]["input_tokens"], 1000);
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 11000);
+        assert_eq!(delta["usage"]["output_tokens"], 10);
     }
 
     #[test]

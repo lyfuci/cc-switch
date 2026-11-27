@@ -4,18 +4,105 @@
 use serde_json::{json, Value};
 
 use crate::agy_config;
+use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
+use crate::services::agy_account::{keychain, AgyAccountManager};
+use crate::services::sync_protocol::sync_mutex;
+use crate::store::AppState;
+
+use super::{lock_native_provider_operations, ProviderService};
 
 pub(crate) fn is_official(provider: &Provider) -> bool {
     // Provider names are user editable and must never silently select OAuth.
-    provider.category.as_deref() == Some("official")
+    provider.has_official_category()
         || provider
             .meta
             .as_ref()
             .and_then(|meta| meta.partner_promotion_key.as_deref())
             == Some("google-official")
+}
+
+fn bound_account_id(provider: &Provider) -> Option<String> {
+    if !is_official(provider) {
+        return None;
+    }
+    provider
+        .meta
+        .as_ref()?
+        .managed_account_id_for("agy_oauth")
+        .filter(|id| !id.trim().is_empty())
+}
+
+/// 保存官方卡的新账号绑定时，同步 agy 的全局登录。只改模型等字段时保留当前登录。
+pub(crate) fn save_from_editor(
+    state: &AppState,
+    accounts: &AgyAccountManager,
+    mut provider: Provider,
+) -> Result<bool, AppError> {
+    let app = AppType::Agy;
+    let binding = bound_account_id(&provider);
+    // Take the sync lock first, as restores may project provider configuration.
+    // Snapshots must wait until the login switch has succeeded or the row is restored.
+    let _sync_guard = (binding.is_some()
+        && should_switch_bound_account(
+            keychain::supported(),
+            crate::commands::tool_runs_in_wsl("agy"),
+        ))
+    .then(|| sync_mutex().blocking_lock());
+    let _guard = lock_native_provider_operations(state, &app);
+    ProviderService::prepare_new_provider(&app, &mut provider)?;
+    let previous = state.db.get_provider_by_id(&provider.id, &app)?;
+    let binding_changed = binding != previous.as_ref().and_then(bound_account_id);
+
+    state.db.save_provider(&app, &provider)?;
+    if !binding_changed {
+        return Ok(true);
+    }
+
+    let written = tauri::async_runtime::block_on(switch_to_bound_account(accounts, &provider));
+    ProviderService::keep_row_if_written(state, &app, &provider.id, previous.as_ref(), written)
+}
+
+fn should_switch_bound_account(keychain_supported: bool, runs_in_wsl: bool) -> bool {
+    keychain_supported && !runs_in_wsl
+}
+
+/// 用授权中心的同一套切换逻辑，写入并核对 agy 的实际登录。
+pub(crate) async fn switch_to_bound_account(
+    accounts: &AgyAccountManager,
+    provider: &Provider,
+) -> Result<(), AppError> {
+    let Some(account_id) = bound_account_id(provider) else {
+        return Ok(());
+    };
+    let runs_in_wsl = crate::commands::tool_runs_in_wsl("agy");
+    if !should_switch_bound_account(keychain::supported(), runs_in_wsl) {
+        if runs_in_wsl {
+            log::info!("[AgyAccount] Antigravity 运行在 WSL 里，忽略卡片绑定的本机账号");
+        }
+        return Ok(());
+    }
+    if !accounts
+        .list()
+        .await
+        .iter()
+        .any(|account| account.id == account_id)
+    {
+        return Err(AppError::localized(
+            "agy.account.bound_missing",
+            format!(
+                "「{}」绑定的 Antigravity 账号不在这台电脑的授权中心里：请先在授权中心添加它，或编辑这张卡改选账号",
+                provider.name
+            ),
+            format!(
+                "The Antigravity account bound to \"{}\" is not in this computer's Auth Center. Add it there, or edit the card to choose another account.",
+                provider.name
+            ),
+        ));
+    }
+    accounts.switch_to(&account_id).await
 }
 
 fn live_settings(provider: &Provider) -> Result<Value, AppError> {
@@ -85,7 +172,11 @@ pub(crate) fn key_resume_target(
     db: &Database,
     command: &str,
 ) -> Result<Option<(Provider, String)>, AppError> {
-    for provider in db.get_all_providers("agy")?.into_values() {
+    for provider in db
+        .get_provider_rows(&AppType::Agy)?
+        .into_readable("识别会话恢复命令")
+        .into_values()
+    {
         let dir = agy_config::key_profile_dir(&provider.id);
         let prefix = agy_config::resume_command(Some(&dir), "");
         let Some(id) = command.strip_prefix(&prefix) else {
@@ -169,5 +260,13 @@ mod tests {
         let mut row = provider("Relay");
         row.settings_config["env"]["GEMINI_API_KEY"] = json!("bad\nkey");
         assert!(live_settings(&row).is_err());
+    }
+
+    #[test]
+    fn agy_bound_account_switch_skips_when_running_in_wsl() {
+        assert!(should_switch_bound_account(true, false));
+        assert!(!should_switch_bound_account(true, true));
+        assert!(!should_switch_bound_account(false, false));
+        assert!(!should_switch_bound_account(false, true));
     }
 }

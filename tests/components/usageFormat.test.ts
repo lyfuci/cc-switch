@@ -22,11 +22,55 @@ import {
   getEstimatedTokensPerSecond,
   getOutputTokensPerSecond,
   getLocaleFromLanguage,
-  sumSpeedTotals,
+  joinNames,
+  joinClauses,
   USD_DISPLAY,
 } from "@/components/usage/format";
 
 describe("usage format helpers", () => {
+  it.each(["zha", "zhb-CN", "jam", "trv-TW"])(
+    "does not apply another language's formatting to %s",
+    (language) => {
+      expect(getLocaleFromLanguage(language)).toBe("en-US");
+      expect(formatTokensShort(10_000, language)).toBe("10.0K");
+      expect(joinNames(["A", "B"], language)).toBe("A, B");
+      expect(joinClauses(["A", "B"], language)).toBe("A; B");
+    },
+  );
+
+  it.each([
+    ["zh-TW-u-nu-hanidec", "zh-TW"],
+    ["zh-Hant-TW", "zh-TW"],
+    ["zh-HK", "zh-TW"],
+    ["zh-hantx", "zh-CN"],
+    ["zh-hkx", "zh-CN"],
+  ])(
+    "respects Chinese script and region boundaries for %s",
+    (language, expected) => {
+      expect(getLocaleFromLanguage(language)).toBe(expected);
+    },
+  );
+
+  it("formats Korean token counts with Korean units and separators", () => {
+    expect(formatTokensShort(9_999, "ko")).toBe("9,999");
+    expect(formatTokensShort(10_000, "ko")).toBe("1.0만");
+    expect(formatTokensShort(12_345, "ko-KR", 2)).toBe("1.23만");
+    expect(formatTokensShort(100_000_000, "ko")).toBe("1.00억");
+    expect(formatTokensShort(123_456_789, "ko_KR")).toBe("1.23억");
+  });
+
+  it("resolves Korean date locales", () => {
+    expect(getLocaleFromLanguage("ko")).toBe("ko-KR");
+    expect(getLocaleFromLanguage("ko-KR")).toBe("ko-KR");
+  });
+  it.each(["kok", "kok-IN", "kos"])(
+    "does not apply Korean date or token formats to %s",
+    (language) => {
+      expect(getLocaleFromLanguage(language)).toBe("en-US");
+      expect(formatTokensShort(10_000, language)).toBe("10.0K");
+      expect(formatTokensShort(100_000_000, language)).toBe("100.00M");
+    },
+  );
   it("formats Traditional Chinese token units with Traditional characters", () => {
     expect(formatTokensShort(12_345, "zh-TW")).toBe("1.2 萬");
     expect(formatTokensShort(123_456_789, "zh-Hant", 2)).toBe("1.23 億");
@@ -118,7 +162,7 @@ describe("usage format helpers", () => {
     ).toBeNull();
   });
 
-  it("hides speed when the generation window is a transport burst", () => {
+  it("hides speed when the generation window is a transport or buffered burst", () => {
     // 2842 tps 实例：输出在首字后 19ms 内全部到达，算出来的是传输突发
     expect(
       getOutputTokensPerSecond({
@@ -127,6 +171,23 @@ describe("usage format helpers", () => {
         firstTokenMs: 3_425,
       }),
     ).toBeNull();
+    // 超过 10,000 tok/s 上限：1001 token / 100ms = 10,010 tok/s
+    expect(
+      getOutputTokensPerSecond({
+        outputTokens: 1_001,
+        latencyMs: 200,
+        firstTokenMs: 100,
+      }),
+    ).toBeNull();
+    // 正常短快回复（如 Haiku 工具调用：首字 2.5s，600ms 输出 200 token -> 333.3 tok/s）不应误杀
+    expect(
+      getOutputTokensPerSecond({
+        outputTokens: 200,
+        latencyMs: 3_100,
+        firstTokenMs: 2_500,
+      }),
+    ).toBeCloseTo(333.333, 2);
+    // 100ms 生成 150 token -> 1500 tok/s（未超过 10,000 tok/s 上限）
     expect(
       getOutputTokensPerSecond({
         outputTokens: 150,
@@ -134,6 +195,42 @@ describe("usage format helpers", () => {
         firstTokenMs: 1_000,
       }),
     ).toBe(1500);
+  });
+
+  it("excludes non-2xx requests from exact and estimated speed", () => {
+    expect(
+      getOutputTokensPerSecond({
+        outputTokens: 500,
+        latencyMs: 6_000,
+        firstTokenMs: 1_000,
+        statusCode: 500,
+      }),
+    ).toBeNull();
+    expect(
+      getOutputTokensPerSecond({
+        outputTokens: 500,
+        latencyMs: 6_000,
+        firstTokenMs: 1_000,
+        statusCode: 200,
+      }),
+    ).toBe(100);
+    expect(
+      getEstimatedTokensPerSecond({
+        outputTokens: 1_000,
+        latencyMs: 10_000,
+        dataSource: "pi_session",
+        statusCode: 499,
+      }),
+    ).toBeNull();
+    // 估算速度也受 10,000 tok/s 上限保护
+    expect(
+      getEstimatedTokensPerSecond({
+        outputTokens: 20_000,
+        latencyMs: 1_500,
+        dataSource: "session_log",
+        statusCode: 200,
+      }),
+    ).toBeNull();
   });
 
   it("formats speed with integer or single-decimal precision", () => {
@@ -174,10 +271,6 @@ describe("usage format helpers", () => {
     const withFirstToken = { ...session, firstTokenMs: 4_000 };
     expect(getEstimatedTokensPerSecond(withFirstToken)).toBe(90);
     expect(getOutputTokensPerSecond(withFirstToken)).toBeNull();
-    expect(sumSpeedTotals([withFirstToken])).toEqual({
-      outputTokens: 0,
-      generationMs: 0,
-    });
   });
 
   it("formats first-token time in seconds", () => {
@@ -216,22 +309,8 @@ describe("usage format helpers", () => {
   });
 
   it("aggregates speed as total output over total generation time, not a mean of rates", () => {
-    const logs = [
-      // 1000 token / 10 s = 100 tok/s
-      { outputTokens: 1_000, latencyMs: 11_000, firstTokenMs: 1_000 },
-      // 200 token / 0.5 s = 400 tok/s（逐条平均会被它拉高）
-      { outputTokens: 200, latencyMs: 1_500, firstTokenMs: 1_000 },
-      // 不计：输出不到 100
-      { outputTokens: 50, latencyMs: 1_100, firstTokenMs: 1_000 },
-      // 不计：没有首字
-      { outputTokens: 5_000, latencyMs: 9_000 },
-    ];
-    const totals = sumSpeedTotals(logs);
-    expect(totals).toEqual({ outputTokens: 1_200, generationMs: 10_500 });
-    const tps = getAggregateTokensPerSecond(
-      totals.outputTokens,
-      totals.generationMs,
-    );
+    // 1000 token / 10 s 和 200 token / 0.5 s：逐条平均是 250，总量相除是 114.29
+    const tps = getAggregateTokensPerSecond(1_200, 10_500);
     expect(tps).toBeCloseTo(114.29, 2);
     expect(getAggregateTokensPerSecond(0, 0)).toBeNull();
     expect(getAggregateTokensPerSecond(500, 0)).toBeNull();
@@ -270,6 +349,27 @@ describe("usage money formatting", () => {
 });
 
 describe("display currency", () => {
+  it("converts won with preset or saved rates and preserves small costs", () => {
+    expect(resolveMoneyDisplay({ currency: "KRW" })).toEqual({
+      currency: "KRW",
+      rate: 1325,
+    });
+    const krw = resolveMoneyDisplay({
+      currency: "KRW",
+      exchangeRates: { KRW: 1400 },
+    });
+    expect(krw).toEqual({ currency: "KRW", rate: 1400 });
+    expect(formatMoney(2, 2, krw)).toBe("₩2,800");
+    expect(formatMoney(0.0012, 4, krw)).toBe("₩1.68");
+    expect(formatMoney(0.000001, 4, krw)).toBe("₩0.0014");
+    expect(formatMoneyShort(0.5, krw)).toBe("₩700");
+    expect(formatMoneyCompact(0.001, krw)).toBe("₩1.40");
+    expect(formatMoneyTick(20000, krw)).toBe("₩20,000");
+    expect(
+      resolveMoneyDisplay({ currency: "KRW", exchangeRates: { KRW: 0 } }),
+    ).toEqual({ currency: "KRW", rate: 1325 });
+  });
+
   it("falls back to USD and the preset rate for unusable settings", () => {
     expect(resolveMoneyDisplay(undefined)).toEqual(USD_DISPLAY);
     expect(resolveMoneyDisplay({ currency: "GBP" })).toEqual(USD_DISPLAY);
@@ -351,14 +451,18 @@ describe("display currency", () => {
       autoExchangeRates: { CNY: 6.9 },
     };
     expect(resolveRateSource(fetched)).toBe("manual");
-    expect(resolveMoneyDisplay(fetched)).toEqual({ currency: "CNY", rate: 6.8 });
-    expect(resolveMoneyDisplay({ ...fetched, exchangeRates: { CNY: 7.1 } })).toEqual(
-      { currency: "CNY", rate: 7.1 },
-    );
-    // 用户主动选了自动才用取到的值
+    expect(resolveMoneyDisplay(fetched)).toEqual({
+      currency: "CNY",
+      rate: 6.8,
+    });
     expect(
-      resolveMoneyDisplay({ ...fetched, rateSource: "auto" }),
-    ).toEqual({ currency: "CNY", rate: 6.9 });
+      resolveMoneyDisplay({ ...fetched, exchangeRates: { CNY: 7.1 } }),
+    ).toEqual({ currency: "CNY", rate: 7.1 });
+    // 用户主动选了自动才用取到的值
+    expect(resolveMoneyDisplay({ ...fetched, rateSource: "auto" })).toEqual({
+      currency: "CNY",
+      rate: 6.9,
+    });
   });
 
   it("refreshes automatic rates only when the cache is missing or stale", () => {

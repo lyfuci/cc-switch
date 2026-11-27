@@ -4,6 +4,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::provider_kind::ProviderKind;
+
+pub(crate) fn parse_billing_multiplier(raw: &str) -> Result<rust_decimal::Decimal, String> {
+    let raw = raw.trim();
+    let syntax_ok = !raw.is_empty() && raw.bytes().all(|c| c.is_ascii_digit() || c == b'.');
+    raw.parse::<rust_decimal::Decimal>()
+        .ok()
+        .filter(|v| {
+            syntax_ok
+                && *v >= rust_decimal::Decimal::ZERO
+                && *v <= rust_decimal::Decimal::from(1000)
+        })
+        .ok_or_else(|| "Billing multiplier must be a decimal from 0 to 1000.".to_string())
+}
+
+pub(crate) fn billing_multiplier(provider: &Provider) -> rust_decimal::Decimal {
+    provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.billing_multiplier.as_deref())
+        .and_then(|raw| parse_billing_multiplier(raw).ok())
+        .unwrap_or(rust_decimal::Decimal::ONE)
+}
+
 // SSOT 模式：不再写供应商副本文件
 
 /// 供应商结构体
@@ -43,7 +67,17 @@ pub struct Provider {
     pub in_failover_queue: bool,
 }
 
+/// `category` 是否标着官方卡。这是唯一比较 `"official"` 的地方；各应用的
+/// `is_official*` 在此之外还各有自己的认法。
+pub fn is_official_category(category: Option<&str>) -> bool {
+    category == Some("official")
+}
+
 impl Provider {
+    pub fn has_official_category(&self) -> bool {
+        is_official_category(self.category.as_deref())
+    }
+
     /// 从现有ID创建供应商
     pub fn with_id(
         id: String,
@@ -68,16 +102,15 @@ impl Provider {
     }
 
     pub fn is_codex_oauth(&self) -> bool {
-        self.provider_type() == Some("codex_oauth")
+        ProviderKind::declared(self) == Some(ProviderKind::CodexOAuth)
     }
 
     pub fn is_xai_oauth(&self) -> bool {
-        self.provider_type() == Some("xai_oauth")
+        ProviderKind::declared(self) == Some(ProviderKind::XaiOAuth)
     }
 
     pub fn is_github_copilot(&self) -> bool {
-        self.provider_type() == Some("github_copilot")
-            || self.claude_base_url_contains("githubcopilot.com")
+        ProviderKind::of(self) == Some(ProviderKind::GitHubCopilot)
     }
 
     pub fn uses_managed_account_auth(&self) -> bool {
@@ -106,10 +139,6 @@ impl Provider {
             .and_then(|m| m.api_key_field.as_deref())
             .map(|field| field.eq_ignore_ascii_case("ANTHROPIC_API_KEY"))
             .unwrap_or(false)
-    }
-
-    fn provider_type(&self) -> Option<&str> {
-        self.meta.as_ref().and_then(|m| m.provider_type.as_deref())
     }
 
     /// The stored OpenCode source format; only native declarations record one.
@@ -213,6 +242,15 @@ impl Provider {
                 (base_url, api_key)
             }
             // Hermes (config.yaml) flattens credentials at the top level, snake_case.
+            // Copilot CLI 自带模型卡：provider 节点（旧版环境变量形状兜底）。
+            AppType::Copilot => {
+                let converted = crate::copilot_config::convert_legacy_settings(settings);
+                let provider = converted.as_ref().unwrap_or(settings).get("provider");
+                (
+                    str_at(provider.and_then(|p| p.get("baseUrl"))),
+                    first_non_empty(provider, &["apiKey", "bearerToken"]),
+                )
+            }
             AppType::Dsh => (
                 str_at(settings.pointer("/options/baseURL")),
                 str_at(settings.pointer("/options/apiKey")),
@@ -230,14 +268,55 @@ impl Provider {
                 str_at(settings.get("baseUrl")),
                 str_at(settings.get("apiKey")),
             ),
+            // CodeBuddy models.json entries keep the full chat/completions endpoint in
+            // `url`; usage scripts expect the API base, same trim as WorkBuddy.
+            AppType::Codebuddy => {
+                let url = str_at(settings.get("url"));
+                let base_url = url
+                    .trim_end_matches('/')
+                    .strip_suffix("/chat/completions")
+                    .map(str::to_string)
+                    .unwrap_or(url);
+                (base_url, str_at(settings.get("apiKey")))
+            }
             // Pi custom providers use the native models.json field names. Pi expands
             // `$NAME` references in `apiKey`, so resolve them before sending (#8822).
             AppType::Pi => (
                 crate::pi_config::provider_base_url(settings).unwrap_or_default(),
                 crate::pi_config::resolve_usage_api_key(&str_at(settings.get("apiKey"))),
             ),
+            // WorkBuddy models.json: shared `url` / `apiKey`, or per-model overrides.
+            AppType::WorkBuddy => {
+                let first_model = settings
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .and_then(|models| models.first());
+                let pick = |field: &str| {
+                    let shared = str_at(settings.get(field));
+                    if shared.is_empty() {
+                        str_at(first_model.and_then(|model| model.get(field)))
+                    } else {
+                        shared
+                    }
+                };
+                let url = pick("url");
+                let base_url = url
+                    .trim_end_matches('/')
+                    .strip_suffix("/chat/completions")
+                    .map(str::to_string)
+                    .unwrap_or(url);
+                (base_url, pick("apiKey"))
+            }
             // OpenCode (OMO) nests credentials under `options` (the SDK options object).
             AppType::OpenCode | AppType::Mcode => {
+                let options = settings.get("options");
+                (
+                    str_at(options.and_then(|o| o.get("baseURL"))),
+                    str_at(options.and_then(|o| o.get("apiKey"))),
+                )
+            }
+            // ZCode nests credentials under `options` (baseURL/apiKey), same as OpenCode.
+            AppType::ZCode => {
                 let options = settings.get("options");
                 (
                     str_at(options.and_then(|o| o.get("baseURL"))),
@@ -519,6 +598,9 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub partner_promotion_key: Option<String>,
+    /// Explicit opt-in multiplier for future proxy cost estimates. Legacy costMultiplier remains inert.
+    #[serde(rename = "billingMultiplier", skip_serializing_if = "Option::is_none")]
+    pub billing_multiplier: Option<String>,
     /// 已停用：供应商级成本倍率。新版不再读取，只为与旧版设备同步时原样往返保留
     #[serde(rename = "costMultiplier", skip_serializing_if = "Option::is_none")]
     pub cost_multiplier: Option<String>,
@@ -936,7 +1018,6 @@ impl UniversalProvider {
             r#"model_provider = "custom"
 model = "{model}"
 model_reasoning_effort = "{reasoning_effort}"
-disable_response_storage = true
 
 [model_providers.custom]
 name = "NewAPI"
@@ -1109,6 +1190,107 @@ pub struct OpenCodeModelLimit {
     /// 输出 token 限制
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<u64>,
+}
+
+// ============================================================================
+// ZCode 供应商配置结构
+// ============================================================================
+
+/// ZCode 供应商的 settings_config 结构
+///
+/// ZCode (zcode.z.ai) 的个人供应商规则位于 `~/.zcode/v2/provider_config.json`，
+/// 通过 `kind` 字段指定供应商类型（anthropic / openai-compatible / openai），
+/// 凭据嵌套在 `options`（baseURL / apiKey），与 OpenCode 结构类似。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ZCodeProviderConfig {
+    /// 供应商显示名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// 供应商类型："anthropic" | "openai-compatible" | "openai"
+    #[serde(default)]
+    pub kind: String,
+
+    /// 供应商选项（API 密钥、基础 URL 等）
+    #[serde(default)]
+    pub options: ZCodeProviderOptions,
+
+    /// 是否启用（可为 true/false/null）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// 来源标记（如 "custom"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// 模型定义映射（IndexMap 保持用户配置的模型顺序，写入 modelOrder 时不变）
+    #[serde(default)]
+    pub models: IndexMap<String, ZCodeModel>,
+
+    /// 捕获所有未明确定义的顶层字段，确保 import/live-sync 不会丢失
+    /// ZCode 配置中的额外属性。
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
+}
+
+/// ZCode 供应商选项
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ZCodeProviderOptions {
+    /// API 基础 URL
+    #[serde(rename = "baseURL", skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// API 密钥
+    #[serde(rename = "apiKey", skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
+    /// 额外选项（headers 等）
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
+}
+
+/// ZCode 模型定义
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ZCodeModel {
+    /// 模型限制（上下文和输出 token 数）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<ZCodeModelLimit>,
+
+    /// 模型输入/输出模态
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<ZCodeModelModalities>,
+
+    /// reasoning 能力描述
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Value>,
+
+    /// 额外字段
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
+}
+
+/// ZCode 模型限制
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ZCodeModelLimit {
+    /// 上下文 token 限制
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<u64>,
+
+    /// 输出 token 限制
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<u64>,
+}
+
+/// ZCode 模型输入/输出模态
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ZCodeModelModalities {
+    /// 输入模态（如 ["text"]）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input: Vec<String>,
+
+    /// 输出模态（如 ["text"]）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1713,6 +1895,22 @@ mod tests {
             (
                 "https://api.deepseek.com".to_string(),
                 "sk-hermes".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_codebuddy_trims_chat_completions() {
+        let p = provider_with(json!({
+            "id": "deepseek-chat",
+            "url": "https://api.deepseek.com/v1/chat/completions/",
+            "apiKey": "sk-codebuddy",
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::Codebuddy),
+            (
+                "https://api.deepseek.com/v1".to_string(),
+                "sk-codebuddy".to_string()
             )
         );
     }

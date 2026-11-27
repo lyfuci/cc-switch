@@ -34,9 +34,8 @@ async fn persists_and_reloads_accounts() {
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0].id, "acc:org");
     assert_eq!(accounts[0].label(), "me@example.com");
-    assert_eq!(reloaded.config_dir_of("acc:org").await, Some(dir.clone()));
-    assert_eq!(reloaded.all_config_dirs().await, vec![dir]);
-    assert_eq!(reloaded.config_dir_of("other").await, None);
+    assert_eq!(config_dir_on_disk(tmp.path(), "acc:org"), Some(dir));
+    assert_eq!(config_dir_on_disk(tmp.path(), "other"), None);
 }
 
 #[tokio::test]
@@ -79,7 +78,7 @@ async fn missing_dir_resolves_to_none() {
     let manager = ClaudeAccountManager::new(tmp.path().to_path_buf());
     let dir = manager.insert_for_test("acc:", "me@example.com").await;
     std::fs::remove_dir_all(&dir).unwrap();
-    assert_eq!(manager.config_dir_of("acc:").await, None);
+    assert_eq!(config_dir_on_disk(tmp.path(), "acc:"), None);
     assert!(manager.list().await[0].requires_reauth);
 }
 
@@ -124,8 +123,7 @@ async fn corrupt_local_id_never_resolves() {
         // 账号表以磁盘为准（切换时可能收录账号）
         manager.persist(&store).unwrap();
     }
-    assert_eq!(manager.config_dir_of("acc:").await, None);
-    assert!(manager.all_config_dirs().await.is_empty());
+    assert_eq!(config_dir_on_disk(tmp.path(), "acc:"), None);
     assert!(manager.list().await[0].requires_reauth);
 }
 
@@ -191,4 +189,45 @@ async fn plan_from_the_credentials_updates_the_account() {
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0].plan.as_deref(), Some("pro"));
     assert_eq!(accounts[0].rate_limit_tier, None);
+}
+
+/// Finishing a login reloads the account file and saves it with the new account.
+/// If the file can't be read, that save must not destroy it: it holds the other
+/// accounts.
+#[tokio::test]
+async fn an_unreadable_account_file_is_kept_instead_of_overwritten() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = ClaudeAccountManager::new(tmp.path().to_path_buf());
+    manager.insert_for_test("acc-a:", "a@example.com").await;
+    manager.insert_for_test("acc-b:", "b@example.com").await;
+    let store_path = tmp.path().join(STORE_FILENAME);
+    let mut unreadable = std::fs::read(&store_path).unwrap();
+    unreadable.extend_from_slice(b"\n}");
+    std::fs::write(&store_path, &unreadable).unwrap();
+
+    let local_id = layout::new_local_id();
+    let config_dir = layout::config_dir(tmp.path(), &local_id);
+    create_private_dir(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"acc-c","emailAddress":"c@example.com"}}"#,
+    )
+    .unwrap();
+    let account = manager
+        .finish_login(
+            local_id,
+            login::LoginExit {
+                success: true,
+                message: String::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("new account");
+
+    assert_eq!(account.label(), "c@example.com");
+    assert!(
+        crate::test_support::dir_holds_file_with(tmp.path(), &unreadable),
+        "the unreadable account file was overwritten"
+    );
 }

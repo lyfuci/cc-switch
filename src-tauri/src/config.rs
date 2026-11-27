@@ -30,27 +30,118 @@ pub fn get_home_dir() -> PathBuf {
     })
 }
 
-/// 检测路径是否为 WSL 网络路径（如 \\wsl$\Ubuntu\... 或 \\wsl.localhost\Ubuntu\...）
-/// 注意：仅检测直接 UNC 路径，映射磁盘符（如 Z: -> \\wsl$\...）无法检测
-#[cfg(windows)]
+/// 检测路径是否为 WSL 网络路径（如 `\\wsl$\Ubuntu\...` 或 `\\wsl.localhost\Ubuntu\...`）。
+/// 映射盘符（如 `Z:` → `\\wsl$\...`）认不出来。字符串形态在非 Windows 上也能认，
+/// 这样技能同步对 UNC 目标走复制，测试不必真的挂载 WSL。
 pub(crate) fn is_wsl_path(path: &Path) -> bool {
-    use std::path::Prefix;
-    if let Some(Component::Prefix(prefix)) = path.components().next() {
-        match prefix.kind() {
-            Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _) => {
-                let s = server.to_string_lossy();
-                s.eq_ignore_ascii_case("wsl$") || s.eq_ignore_ascii_case("wsl.localhost")
+    if wsl_unc_to_linux(&path.to_string_lossy()).is_some() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            if let Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _) = prefix.kind() {
+                let server = server.to_string_lossy();
+                return server.eq_ignore_ascii_case("wsl$")
+                    || server.eq_ignore_ascii_case("wsl.localhost");
             }
-            _ => false,
         }
+    }
+    false
+}
+
+/// `\\wsl.localhost\<distro>\home\...`, `\\wsl$\<distro>\...`, `//wsl.localhost/...`,
+/// and `\\?\UNC\wsl.localhost\...`. Returns `(distro, /linux/path)`.
+pub(crate) fn wsl_unc_to_linux(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let slashed = trimmed.replace('/', "\\");
+    let verbatim = r"\\?\UNC\";
+    let normalized = if slashed
+        .as_bytes()
+        .get(..verbatim.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(verbatim.as_bytes()))
+    {
+        format!(r"\\{}", &slashed[verbatim.len()..])
     } else {
-        false
+        slashed
+    };
+    let rest = normalized.strip_prefix(r"\\")?;
+    let mut parts = rest.split('\\').filter(|part| !part.is_empty());
+    let server = parts.next()?;
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return None;
+    }
+    let distro = parts.next()?.to_string();
+    if !is_wsl_distro_name(&distro) {
+        return None;
+    }
+    let mut linux = String::new();
+    for part in parts {
+        if part == "." || part == ".." {
+            return None;
+        }
+        linux.push('/');
+        linux.push_str(part);
+    }
+    if linux.is_empty() {
+        return None;
+    }
+    Some((distro, linux))
+}
+
+fn is_wsl_distro_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Confirm `path` stays under `root`. Uses filesystem canonicalization first so
+/// symlinks cannot escape `root`; when a WSL UNC path cannot be canonicalized,
+/// falls back to comparing same-distro `wsl_unc_to_linux` prefixes (rejecting `.`/`..`).
+pub(crate) fn path_stays_inside(root: &Path, path: &Path) -> Result<bool, String> {
+    if let (Ok(root), Ok(path)) = (root.canonicalize(), path.canonicalize()) {
+        return Ok(path == root || path.starts_with(root));
+    }
+    match (
+        wsl_unc_to_linux(&root.to_string_lossy()),
+        wsl_unc_to_linux(&path.to_string_lossy()),
+    ) {
+        (Some((root_distro, root_linux)), Some((path_distro, path_linux))) => Ok(root_distro
+            .eq_ignore_ascii_case(&path_distro)
+            && (path_linux == root_linux || path_linux.starts_with(&format!("{root_linux}/")))),
+        _ => Err(format!(
+            "cannot confirm {} stays inside {}",
+            path.display(),
+            root.display()
+        )),
     }
 }
 
-#[cfg(not(windows))]
-pub(crate) fn is_wsl_path(_path: &Path) -> bool {
-    false
+/// A WSL UNC path in `distro`, or a Windows drive path (`C:\...` -> `/mnt/c/...`).
+#[cfg(any(windows, test))]
+pub(crate) fn path_into_wsl(raw: &str, distro: &str) -> Option<String> {
+    if let Some((found, linux)) = wsl_unc_to_linux(raw) {
+        return found.eq_ignore_ascii_case(distro).then_some(linux);
+    }
+    let normalized = raw.trim().replace('/', "\\");
+    let mut chars = normalized.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
+        return None;
+    }
+    let rest = chars.as_str().trim_start_matches('\\');
+    let mut linux = format!("/mnt/{}", drive.to_ascii_lowercase());
+    if !rest.is_empty() {
+        linux.push('/');
+        linux.push_str(&rest.replace('\\', "/"));
+    }
+    Some(linux)
 }
 
 /// 临时目录在 WSL 共享路径上时（WSL2 夜间测试），SQLite 拿不到文件锁，
@@ -75,7 +166,7 @@ pub(crate) fn sqlite_unsupported_in_temp_dir() -> bool {
 ///
 /// 用 `var_os` 而非 `var`：非 Unicode 的取值只应让路径变 lossy，而不该让
 /// “覆盖是否存在”的判断失效、进而退回真实用户目录。
-fn test_home_override() -> Option<PathBuf> {
+pub(crate) fn test_home_override() -> Option<PathBuf> {
     let raw = std::env::var_os("CC_SWITCH_TEST_HOME")?;
     // to_string_lossy 的结果必须先绑住，否则 trim 借的是一个已释放的临时值。
     let lossy = raw.to_string_lossy();
@@ -89,7 +180,7 @@ fn test_home_override() -> Option<PathBuf> {
 
 /// 获取 Claude Code 配置目录路径
 pub fn get_claude_config_dir() -> PathBuf {
-    if let Some(custom) = crate::settings::get_claude_override_dir() {
+    if let Some(custom) = crate::settings::get_override_dir(&crate::app_config::AppType::Claude) {
         return custom;
     }
 
@@ -140,7 +231,7 @@ fn comparable_path_key(path: &Path) -> String {
     key
 }
 
-fn path_eq_lexical(left: &Path, right: &Path) -> bool {
+pub(crate) fn path_eq_lexical(left: &Path, right: &Path) -> bool {
     comparable_path_key(left) == comparable_path_key(right)
 }
 
@@ -284,7 +375,8 @@ fn derive_mcp_path_from_override(dir: &Path) -> PathBuf {
 
 /// 获取 Claude MCP 配置文件路径
 pub fn get_claude_mcp_path() -> PathBuf {
-    if let Some(custom_dir) = crate::settings::get_claude_override_dir() {
+    if let Some(custom_dir) = crate::settings::get_override_dir(&crate::app_config::AppType::Claude)
+    {
         if let Some(path) = default_mcp_path_for_config_dir(&custom_dir) {
             return path;
         }
@@ -358,28 +450,6 @@ pub fn get_app_config_dir() -> PathBuf {
 /// 获取应用配置文件路径
 pub fn get_app_config_path() -> PathBuf {
     get_app_config_dir().join("config.json")
-}
-
-/// 清理供应商名称，确保文件名安全
-#[allow(dead_code)]
-pub fn sanitize_provider_name(name: &str) -> String {
-    name.chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
-            _ => c,
-        })
-        .collect::<String>()
-        .to_lowercase()
-}
-
-/// 获取供应商配置文件路径
-#[allow(dead_code)]
-pub fn get_provider_config_path(provider_id: &str, provider_name: Option<&str>) -> PathBuf {
-    let base_name = provider_name
-        .map(sanitize_provider_name)
-        .unwrap_or_else(|| sanitize_provider_name(provider_id));
-
-    get_claude_config_dir().join(format!("settings-{base_name}.json"))
 }
 
 /// 读取 JSON 配置文件
@@ -459,6 +529,41 @@ pub fn write_text_file_private(path: &Path, data: &str) -> Result<(), AppError> 
     atomic_write_private(path, data.as_bytes())
 }
 
+/// 读 CC Switch 自己的 JSON 数据文件（账号表这类）。没有文件时是默认值；读不了或
+/// 解析不了时先把它改名成 `<文件名>.unreadable-<毫秒时间戳>` 留着，再按默认值继续——
+/// 否则下一次保存会用空表把里面的数据整份覆盖掉。
+pub(crate) fn load_json_or_set_aside<T: serde::de::DeserializeOwned + Default>(
+    path: &Path,
+    tag: &str,
+) -> T {
+    let error = match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(value) => return value,
+            Err(error) => error.to_string(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return T::default(),
+        Err(error) => error.to_string(),
+    };
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(
+        ".unreadable-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let aside = PathBuf::from(aside);
+    match fs::rename(path, &aside) {
+        Ok(()) => log::warn!(
+            "[{tag}] {} 读不了（{error}），已改名为 {} 保留，按空表继续",
+            path.display(),
+            aside.display()
+        ),
+        Err(rename_error) => log::warn!(
+            "[{tag}] {} 读不了（{error}），改名保留也失败（{rename_error}），按空表继续",
+            path.display()
+        ),
+    }
+    T::default()
+}
+
 /// 原子写入：写入临时文件后 rename 替换，避免半写状态
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
     atomic_write_with_unix_mode(path, data, None)
@@ -490,6 +595,16 @@ impl StagedWrite {
         &self.tmp
     }
 
+    /// 提交时实际被替换的文件（目标是软链接时为它最终指向的文件）。
+    pub fn target(&self) -> &Path {
+        &self.path
+    }
+
+    /// 放弃这次写入，删掉临时文件。
+    pub fn discard(self) {
+        let _ = fs::remove_file(&self.tmp);
+    }
+
     /// 用临时文件替换目标（失败时删掉临时文件）。
     pub fn commit(self) -> Result<(), AppError> {
         commit_staged(&self.tmp, &self.path).inspect_err(|_| {
@@ -508,6 +623,9 @@ pub(crate) fn stage_write(
 ) -> Result<StagedWrite, AppError> {
     #[cfg(not(unix))]
     let _ = unix_mode;
+
+    let resolved = resolve_symlink_target(path);
+    let path = resolved.as_path();
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
@@ -585,11 +703,76 @@ pub(crate) fn stage_write(
     })
 }
 
+/// 目标是软链接时返回它最终指向的文件（逐跳 `read_link`，相对目标按链接所在目录解析），
+/// 否则原样返回。原子写要替换的是这个最终文件：rename 到软链接本身会把链接换成普通
+/// 文件（Unix），Windows 的 `ReplaceFileW` 则直接报 os error 1464。只解析最后一段，
+/// 不碰路径里的目录软链；除相对目标带 `..` 外不做 `canonicalize`（Windows 上会把路径
+/// 改写成 `\\?\` 形式），普通文件原样返回。
+/// 悬空链接照样返回它指向的路径，写入时会在那里新建文件、链接保留。
+pub(crate) fn resolve_symlink_target(path: &Path) -> PathBuf {
+    // 与 Linux 的 MAXSYMLINKS 一致，防止链接成环时死循环。
+    const MAX_HOPS: usize = 40;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        let is_link = fs::symlink_metadata(&current)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            return current;
+        }
+        let Ok(target) = fs::read_link(&current) else {
+            return current;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            match current.parent() {
+                Some(parent) => join_link_target(parent, &target),
+                None => target,
+            }
+        };
+    }
+    log::warn!("软链接层数过多，按原路径写入: {}", path.display());
+    path.to_path_buf()
+}
+
+/// 把相对链接目标接到链接所在目录上。目标里有 `..` 时先把目录解析成真实路径再逐段
+/// 回退：Windows 按字面折叠 `..`，链接所在目录本身是 junction / 目录软链时会退到
+/// 错误的上级目录（Unix 内核按真实路径解析，结果一样）。
+fn join_link_target(parent: &Path, target: &Path) -> PathBuf {
+    if !target
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return parent.join(target);
+    }
+    let Ok(mut resolved) = fs::canonicalize(parent) else {
+        return parent.join(target);
+    };
+    for component in target.components() {
+        match component {
+            Component::ParentDir => {
+                // 已走过的段里也可能有目录软链，回退前先解析成真实路径。
+                if let Ok(real) = fs::canonicalize(&resolved) {
+                    resolved = real;
+                }
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    resolved
+}
+
 /// 原子写的后半步：用 `tmp` 替换 `path`。崩溃恢复也用它提交上次留下的临时文件。
+/// `path` 是软链接时替换它指向的文件，链接本身保留。
 ///
 /// 失败时临时文件留在原处：写入引擎的 pending 指着它，下次恢复要靠它前滚（目标文件被
 /// 占用、只读这类失败，过后多半能补完）。只做一次性原子写的调用方自己删。
 pub(crate) fn commit_staged(tmp: &Path, path: &Path) -> Result<(), AppError> {
+    let resolved = resolve_symlink_target(path);
+    let path = resolved.as_path();
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -750,6 +933,111 @@ mod tests {
         // 一次性的原子写不留临时文件。
         assert!(staged.commit().is_err());
         assert!(!tmp.exists());
+    }
+
+    /// dotfiles 用户把 settings.json 等配置软链到别的目录（#6764 / #9283）：原子写要
+    /// 写透到链接指向的文件，链接本身保留，临时文件建在目标旁边、不留残留。
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_writes_through_symlinks_and_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let real = dotfiles.join("settings.json");
+        std::fs::write(&real, b"old contents").unwrap();
+        // 相对链接 + 两跳：home/settings.json -> home/hop.json -> ../dotfiles/settings.json
+        let hop = home.join("hop.json");
+        let link = home.join("settings.json");
+        std::os::unix::fs::symlink("../dotfiles/settings.json", &hop).unwrap();
+        std::os::unix::fs::symlink("hop.json", &link).unwrap();
+
+        atomic_write_private(&link, b"new contents").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&hop)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"new contents");
+        for d in [&dotfiles, &home] {
+            let leftovers: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|name| name.contains(".tmp."))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "temporary files remain: {leftovers:?}"
+            );
+        }
+
+        // 写入引擎的两步写（以及崩溃前滚）拿的也是链接路径。
+        let staged = stage_write(&link, b"engine contents", None, false).unwrap();
+        assert_eq!(
+            staged.tmp_path().parent().unwrap().canonicalize().unwrap(),
+            dotfiles.canonicalize().unwrap()
+        );
+        let tmp = staged.tmp_path().to_path_buf();
+        commit_staged(&tmp, &link).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"engine contents");
+    }
+
+    /// 链接所在目录本身是目录软链、相对目标带 `..` 时，`..` 要按真实目录回退。
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_dir_is_resolved_before_walking_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let sync = dir.path().join("sync");
+        let real_dir = sync.join("claude");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = sync.join("settings.json");
+        std::fs::write(&real, b"old").unwrap();
+        std::os::unix::fs::symlink("../settings.json", real_dir.join("settings.json")).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&real_dir, home.join(".claude")).unwrap();
+        let link = home.join(".claude").join("settings.json");
+
+        assert_eq!(resolve_symlink_target(&link), real.canonicalize().unwrap());
+        atomic_write(&link, b"new").unwrap();
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+
+        // 目标里先经过一个目录软链再回退：`sub/../other.json`，sub -> sync/claude。
+        let other = sync.join("other.json");
+        std::fs::write(&other, b"old").unwrap();
+        std::os::unix::fs::symlink(&real_dir, home.join("sub")).unwrap();
+        let link2 = home.join("other.json");
+        std::os::unix::fs::symlink("sub/../other.json", &link2).unwrap();
+        assert_eq!(
+            resolve_symlink_target(&link2),
+            other.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_the_target_of_a_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        atomic_write(&link, b"contents").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"contents");
     }
 
     #[cfg(windows)]
@@ -1019,7 +1307,8 @@ mod tests {
         // 进程级环境变量的读写必须与同样改它们的测试互斥。锁是模块级共享的
         // （写成测试函数体内的 static 只能锁住自己，等于没锁），见
         // `proxy::http_client` 里同一套 env_lock() 用法。
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        use crate::sync_utils::MutexExt;
+        let _guard = env_lock().lock_recover();
 
         // 假装 HOME 指向另一处，并且那里有一份 db——正是会触发回退的形状
         let legacy_home = tempfile::tempdir().expect("tempdir");
@@ -1028,28 +1317,96 @@ mod tests {
         std::fs::write(legacy_dir.join("cc-switch.db"), b"legacy").expect("seed legacy db");
 
         let test_home = tempfile::tempdir().expect("tempdir");
-        let saved_home = std::env::var_os("HOME");
-        let saved_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
-
-        std::env::set_var("HOME", legacy_home.path());
-        std::env::set_var("CC_SWITCH_TEST_HOME", test_home.path());
+        let env = crate::test_support::EnvVars::new()
+            .set("HOME", legacy_home.path())
+            .set("CC_SWITCH_TEST_HOME", test_home.path());
 
         let dir = get_app_config_dir();
 
-        match saved_test_home {
-            Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
-            None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
-        }
-        match saved_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
+        drop(env);
 
         let expected = test_home.path().join(".cc-switch");
         assert_eq!(
             dir, expected,
             "测试 home 优先：不得回退到 HOME 下的旧库目录"
         );
+    }
+
+    #[test]
+    fn non_ascii_paths_do_not_panic_and_parse_wsl_unc_roots() {
+        for path in [
+            "/Users/张三/.claude.json",
+            r"D:\开发\project",
+            "/home/用户/.gemini",
+            "中文路径",
+        ] {
+            assert!(
+                !is_wsl_path(Path::new(path)),
+                "unexpected WSL match: {path}"
+            );
+            assert_eq!(wsl_unc_to_linux(path), None);
+        }
+
+        for raw in [
+            r"\\wsl.localhost\Ubuntu\home\张三\.gemini",
+            r"\\wsl$\Ubuntu\home\张三\.gemini",
+            r"\\?\UNC\wsl.localhost\Ubuntu\home\张三\.gemini",
+        ] {
+            assert!(is_wsl_path(Path::new(raw)), "expected WSL match: {raw}");
+            assert_eq!(
+                wsl_unc_to_linux(raw),
+                Some(("Ubuntu".into(), "/home/张三/.gemini".into())),
+                "{raw}"
+            );
+        }
+
+        assert_eq!(
+            path_into_wsl(r"D:\开发\project", "Ubuntu"),
+            Some("/mnt/d/开发/project".into())
+        );
+    }
+
+    #[test]
+    fn path_stays_inside_checks_canonical_paths_and_wsl_unc_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let child = root.join("brain/sess/transcript_full.jsonl");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        std::fs::write(&child, "").unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("secret");
+        std::fs::write(&outside_file, "").unwrap();
+
+        assert_eq!(path_stays_inside(&root, &child), Ok(true));
+        assert_eq!(path_stays_inside(&root, &outside_file), Ok(false));
+
+        #[cfg(unix)]
+        {
+            let link = root.join("escape");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert_eq!(path_stays_inside(&root, &link.join("secret")), Ok(false));
+        }
+
+        let wsl_root =
+            Path::new(r"\\wsl.localhost\Ubuntu-26.04\home\alice\.gemini\antigravity-cli");
+        let wsl_inside = Path::new(
+            r"\\WSL$\ubuntu-26.04\home\alice\.gemini\antigravity-cli\conversations\abc.db",
+        );
+        let wsl_sibling = Path::new(
+            r"\\wsl.localhost\Ubuntu-26.04\home\alice\.gemini\antigravity-cli-other\conversations\abc.db",
+        );
+        let wsl_other_distro = Path::new(
+            r"\\wsl.localhost\Debian\home\alice\.gemini\antigravity-cli\conversations\abc.db",
+        );
+        let wsl_traversal = Path::new(
+            r"\\wsl.localhost\Ubuntu-26.04\home\alice\.gemini\antigravity-cli\..\other\abc.db",
+        );
+
+        assert_eq!(path_stays_inside(wsl_root, wsl_inside), Ok(true));
+        assert_eq!(path_stays_inside(wsl_root, wsl_sibling), Ok(false));
+        assert_eq!(path_stays_inside(wsl_root, wsl_other_distro), Ok(false));
+        assert!(path_stays_inside(wsl_root, wsl_traversal).is_err());
     }
 }
 

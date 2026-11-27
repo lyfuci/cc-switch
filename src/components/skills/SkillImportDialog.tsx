@@ -6,14 +6,14 @@ import { DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { AppGlyph, APP_DISPLAY_NAME } from "@/components/shell/AppGlyph";
 import type { AppId } from "@/lib/api/types";
 import type { ImportSkillSelection, UnmanagedSkill } from "@/lib/api/skills";
-import { SKILLS_APP_IDS } from "@/config/appConfig";
 import { cn } from "@/lib/utils";
 import { MatrixSearch } from "@/components/mcp/AppMatrix";
 import { CHECKBOX_CLASS, V7Dialog } from "@/components/mcp/formBits";
+import { APP_IDS_WITH } from "@/config/appSpecs";
 
 /** Pi 与 Oh My Pi 的启用状态由各自原生 skills 目录里有没有这个目录决定，导入时不勾选 */
 const NATIVE_DIR_APPS: AppId[] = ["pi", "omp"];
-const IMPORT_APP_IDS = SKILLS_APP_IDS.filter(
+const IMPORT_APP_IDS = APP_IDS_WITH.skills.filter(
   (app) => !NATIVE_DIR_APPS.includes(app),
 );
 
@@ -26,7 +26,7 @@ interface SkillImportDialogProps {
 }
 
 const isAppId = (value: string): value is AppId =>
-  (SKILLS_APP_IDS as string[]).includes(value);
+  (APP_IDS_WITH.skills as string[]).includes(value);
 
 /** 「导入本机已有…」（宽 560）：选目录 + 选导入后在哪些应用启用。 */
 export function SkillImportDialog({
@@ -93,20 +93,14 @@ export function SkillImportDialog({
           }
           return {
             directory: skill.directory,
+            // 按导入清单逐个取，免得新应用漏写（ZCode 曾在这里被漏掉，勾了也不生效）
             apps: {
-              claude: chosen.has("claude"),
-              codex: chosen.has("codex"),
-              gemini: chosen.has("gemini"),
-              grokbuild: chosen.has("grokbuild"),
-              opencode: chosen.has("opencode"),
               openclaw: false,
-              hermes: chosen.has("hermes"),
               pi: false,
-              mcode: chosen.has("mcode"),
-              kimi: chosen.has("kimi"),
-              dsh: chosen.has("dsh"),
-              agy: chosen.has("agy"),
-            },
+              ...Object.fromEntries(
+                IMPORT_APP_IDS.map((app) => [app, chosen.has(app)]),
+              ),
+            } as ImportSkillSelection["apps"],
           };
         }),
     );

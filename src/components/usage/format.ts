@@ -1,3 +1,9 @@
+import {
+  isTraditionalChineseTag,
+  LANGUAGES,
+  languageFromLocale,
+  normalizeLanguageTag,
+} from "@/i18n/languages";
 import type { UsageDisplaySettings } from "@/types";
 export function parseFiniteNumber(value: unknown): number | null {
   if (typeof value === "number") {
@@ -23,7 +29,7 @@ export function fmtInt(
 }
 
 /** 用量金额的显示币种。库里一律存美元，只在显示时按 `rate`（1 美元折多少）换算。 */
-/** 界面语言各自的币种（en→USD、zh→CNY、ja→JPY、zh-TW→TWD、tr→TRY），外加欧元 */
+/** 可选显示币种，与界面语言独立。 */
 export const DISPLAY_CURRENCIES = [
   "USD",
   "CNY",
@@ -31,18 +37,21 @@ export const DISPLAY_CURRENCIES = [
   "JPY",
   "TWD",
   "TRY",
+  "KRW",
 ] as const;
 
 export type DisplayCurrency = (typeof DISPLAY_CURRENCIES)[number];
 
 /**
  * 用户没填汇率、也还没自动取到时用的起点，按 2026-07~09 的报价取整。
+ * KRW 按 2026-10-23 的参考报价取整（1 USD ≈ 1325 KRW）。
+ * https://wise.com/au/currency-converter/usd-to-krw-rate/history/23-10-2026
  * 改这里只影响手填和自动都没值的用户。
  */
 export const DEFAULT_EXCHANGE_RATES: Record<
   Exclude<DisplayCurrency, "USD">,
   number
-> = { CNY: 6.8, EUR: 0.87, JPY: 158, TWD: 32, TRY: 48 };
+> = { CNY: 6.8, EUR: 0.87, JPY: 158, TWD: 32, TRY: 48, KRW: 1325 };
 
 /** 汇率来源：自动获取（每日更新）或手动填写 */
 export const RATE_SOURCES = ["auto", "manual"] as const;
@@ -152,13 +161,17 @@ const CURRENCY_SYMBOL: Record<DisplayCurrency, string> = {
   JPY: "¥",
   TWD: "NT$",
   TRY: "₺",
+  KRW: "₩",
 };
 
-/** 日元面额大（1 美元约 158 日元），同一处少显示两位小数：$0.0012 → ¥0.19 */
-const FEWER_DIGITS: Partial<Record<DisplayCurrency, number>> = { JPY: 2 };
+/** 日元和韩元面额大，同一处少显示两位小数：$0.0012 → ¥0.19 */
+const FEWER_DIGITS: Partial<Record<DisplayCurrency, number>> = {
+  JPY: 2,
+  KRW: 2,
+};
 
 /**
- * 换算出来的金额是按手填汇率估的，再多位数也不更准：最多两位小数（日元再少两位）。
+ * 换算出来的金额是按手填汇率估的，再多位数也不更准：最多两位小数（日元、韩元再少两位）。
  * 美元按调用方给的位数。
  */
 function shownDigits(display: MoneyDisplay, digits: number): number {
@@ -247,11 +260,21 @@ export function formatMoneyTick(value: unknown, display: MoneyDisplay): string {
 /** 输出少于这个数的请求（工具调用这类）不算速度：0.1 秒回 15 个 token 会算出离谱的数。 */
 export const SPEED_MIN_OUTPUT_TOKENS = 100;
 
+/** 速度上限（tok/s）：超过该值属于整包突发或异常计时，不计入速度。 */
+export const SPEED_MAX_TPS = 10_000;
+
 interface OutputTokensPerSecondInput {
   outputTokens: unknown;
   latencyMs: unknown;
   firstTokenMs?: unknown;
   dataSource?: unknown;
+  statusCode?: unknown;
+}
+
+function isSuccessStatusOrUnset(statusCode: unknown): boolean {
+  if (statusCode == null) return true;
+  const code = parseFiniteNumber(statusCode);
+  return code != null && code >= 200 && code < 300;
 }
 
 /**
@@ -265,7 +288,9 @@ export function getGenerationMs(
   if (isSessionLogRequest(log)) return null;
   const latencyMs = parseFiniteNumber(log.latencyMs);
   const firstTokenMs = parseFiniteNumber(log.firstTokenMs);
-  if (latencyMs == null || firstTokenMs == null) return null;
+  if (latencyMs == null || firstTokenMs == null || firstTokenMs < 0) {
+    return null;
+  }
   const generationMs = latencyMs - firstTokenMs;
   return generationMs > 0 ? generationMs : null;
 }
@@ -274,15 +299,47 @@ export function getGenerationMs(
 // 同一个网络包里，窗口只剩几毫秒，算出来的是传输突发而不是生成速度。
 export const SPEED_MIN_GENERATION_MS = 100;
 
-/** 这条请求能不能算速度：输出不少于 100 token，且生成时间不短于 100 毫秒。 */
-export function isSpeedEligible(log: OutputTokensPerSecondInput): boolean {
+/**
+ * 判断一条已达输出门槛、且带首字计时的成功路由请求是否因为传输突发/中转缓冲而被排除。
+ */
+export function isSpeedBurstExcluded(log: OutputTokensPerSecondInput): boolean {
+  if (isSessionLogRequest(log) || !isSuccessStatusOrUnset(log.statusCode)) {
+    return false;
+  }
   const outputTokens = parseFiniteNumber(log.outputTokens);
+  const firstTokenMs = parseFiniteNumber(log.firstTokenMs);
+  const generationMs = getGenerationMs(log);
+  if (
+    outputTokens == null ||
+    outputTokens < SPEED_MIN_OUTPUT_TOKENS ||
+    firstTokenMs == null ||
+    firstTokenMs < 0
+  ) {
+    return false;
+  }
+  if (generationMs == null || generationMs < SPEED_MIN_GENERATION_MS) {
+    return true;
+  }
+  return outputTokens * 1000 > SPEED_MAX_TPS * generationMs;
+}
+
+/**
+ * 这条请求能不能算速度（与后端 `speed_eligible_sql` 同口径）：
+ * 成功的路由请求、输出 ≥ 100 token、生成时间 ≥ 100ms、速度 ≤ 10,000 tok/s。
+ */
+export function isSpeedEligible(log: OutputTokensPerSecondInput): boolean {
+  if (!isSuccessStatusOrUnset(log.statusCode)) return false;
+  const outputTokens = parseFiniteNumber(log.outputTokens);
+  const firstTokenMs = parseFiniteNumber(log.firstTokenMs);
   const generationMs = getGenerationMs(log);
   return (
     outputTokens != null &&
     outputTokens >= SPEED_MIN_OUTPUT_TOKENS &&
+    firstTokenMs != null &&
+    firstTokenMs >= 0 &&
     generationMs != null &&
-    generationMs >= SPEED_MIN_GENERATION_MS
+    generationMs >= SPEED_MIN_GENERATION_MS &&
+    outputTokens * 1000 <= SPEED_MAX_TPS * generationMs
   );
 }
 
@@ -317,11 +374,13 @@ export function isSessionLogRequest(log: { dataSource?: unknown }): boolean {
 
 /**
  * 这条请求能不能估速度（和后端 `speed_estimate_eligible_sql` 同口径）：会话日志导入、
- * 输出不少于 200 token、估算耗时不短于 1 秒。推出了首字的也照样按整段耗时算。
+ * 成功请求、输出不少于 200 token、估算耗时不短于 1 秒、估算速度不超过 10,000 tok/s。
+ * 推出了首字的也照样按整段耗时算。
  */
 export function isSpeedEstimateEligible(
   log: OutputTokensPerSecondInput,
 ): boolean {
+  if (!isSuccessStatusOrUnset(log.statusCode)) return false;
   const outputTokens = parseFiniteNumber(log.outputTokens);
   const latencyMs = parseFiniteNumber(log.latencyMs);
   return (
@@ -329,7 +388,8 @@ export function isSpeedEstimateEligible(
     outputTokens != null &&
     outputTokens >= SPEED_ESTIMATE_MIN_OUTPUT_TOKENS &&
     latencyMs != null &&
-    latencyMs >= SPEED_ESTIMATE_MIN_DURATION_MS
+    latencyMs >= SPEED_ESTIMATE_MIN_DURATION_MS &&
+    outputTokens * 1000 <= SPEED_MAX_TPS * latencyMs
   );
 }
 
@@ -346,7 +406,7 @@ export function getEstimatedTokensPerSecond(
 
 /**
  * 汇总速度 = Σ输出 ÷ Σ生成时间（只算满足条件的请求），不是逐条平均——
- * 逐条平均会被短请求带歪。分子分母都来自后端汇总（或 [sumSpeedTotals]）。
+ * 逐条平均会被短请求带歪。分子分母都来自后端汇总。
  */
 export function getAggregateTokensPerSecond(
   outputTokens: unknown,
@@ -357,21 +417,6 @@ export function getAggregateTokensPerSecond(
   if (output == null || ms == null || output <= 0 || ms <= 0) return null;
   const tps = output / (ms / 1000);
   return Number.isFinite(tps) && tps > 0 ? tps : null;
-}
-
-/** 前端已有明细时的汇总：只累加满足条件的请求。 */
-export function sumSpeedTotals(logs: readonly OutputTokensPerSecondInput[]): {
-  outputTokens: number;
-  generationMs: number;
-} {
-  let outputTokens = 0;
-  let generationMs = 0;
-  for (const log of logs) {
-    if (!isSpeedEligible(log)) continue;
-    outputTokens += parseFiniteNumber(log.outputTokens) as number;
-    generationMs += getGenerationMs(log) as number;
-  }
-  return { outputTokens, generationMs };
 }
 
 /** tok/s 的显示：≥ 1 取整，否则一位小数；null 原样返回（界面显示「—」）。 */
@@ -430,30 +475,11 @@ export function formatTokensCompact(value: unknown, locale?: string): string {
   return String(num);
 }
 
-function normalizeLanguageTag(language: string): string {
-  return language.toLowerCase().replace(/_/g, "-");
-}
-
-function isTraditionalChineseLanguage(normalizedLanguage: string): boolean {
-  return (
-    normalizedLanguage === "zh-tw" ||
-    normalizedLanguage.startsWith("zh-hant") ||
-    normalizedLanguage.startsWith("zh-hk") ||
-    normalizedLanguage.startsWith("zh-mo")
-  );
-}
-
+/** 语言码或系统区域对应的日期数字 locale；空值用 en-US。 */
 export function getLocaleFromLanguage(language: string): string {
   if (!language) return "en-US";
-  const normalized = normalizeLanguageTag(language);
-  if (normalized === "zh") return "zh-CN";
-  if (isTraditionalChineseLanguage(normalized)) {
-    return "zh-TW";
-  }
-  if (normalized.startsWith("zh")) return "zh-CN";
-  if (normalized.startsWith("ja")) return "ja-JP";
-  if (normalized.startsWith("tr")) return "tr-TR";
-  return "en-US";
+  const id = languageFromLocale(normalizeLanguageTag(language));
+  return LANGUAGES.find((entry) => entry.id === id)!.locale;
 }
 
 interface I18nLike {
@@ -465,25 +491,30 @@ export function getResolvedLang(i18n: I18nLike): string {
   return i18n.resolvedLanguage || i18n.language || "en";
 }
 
-function isCjkLanguage(lang: string): boolean {
+function usesChineseJapanesePunctuation(lang: string): boolean {
   const normalized = normalizeLanguageTag(lang);
-  return normalized.startsWith("zh") || normalized.startsWith("ja");
+  return (
+    normalized === "zh" ||
+    normalized.startsWith("zh-") ||
+    normalized === "ja" ||
+    normalized.startsWith("ja-")
+  );
 }
 
 /** 并列的名字：中日文用「、」，其他语言用逗号。 */
 export function joinNames(items: readonly string[], lang: string): string {
-  return items.join(isCjkLanguage(lang) ? "、" : ", ");
+  return items.join(usesChineseJapanesePunctuation(lang) ? "、" : ", ");
 }
 
 /** 并列的分句：中日文用「；」，其他语言用分号。 */
 export function joinClauses(items: readonly string[], lang: string): string {
-  return items.join(isCjkLanguage(lang) ? "；" : "; ");
+  return items.join(usesChineseJapanesePunctuation(lang) ? "；" : "; ");
 }
 
 /**
  * Token 数量的紧凑显示。
  *
- * Why: 中日文用户期待 "亿/万" 量纲；英文用户期待 K/M/B。共用同一份格式化
+ * Why: 中日文用户期待 "亿/万" 量纲，韩文使用 "억/만"；英文用户期待 K/M/B。共用同一份格式化
  * 逻辑避免 Hero 卡和分应用卡显示不一致。`compactDecimals=2` 用于 Hero
  * 大数副标（更精确），默认 1 位用于卡片副字段。
  */
@@ -495,15 +526,25 @@ export function formatTokensShort(
   if (!Number.isFinite(value) || value <= 0) return "0";
   const decimals = compactDecimals;
   const normalizedLang = normalizeLanguageTag(lang);
-  if (isTraditionalChineseLanguage(normalizedLang)) {
+  if (isTraditionalChineseTag(normalizedLang)) {
     if (value >= 1e8) return `${(value / 1e8).toFixed(2)} 億`;
     if (value >= 1e4) return `${(value / 1e4).toFixed(decimals)} 萬`;
     return value.toLocaleString("zh-TW");
   }
-  if (normalizedLang.startsWith("zh") || normalizedLang.startsWith("ja")) {
+  if (
+    normalizedLang === "zh" ||
+    normalizedLang.startsWith("zh-") ||
+    normalizedLang === "ja" ||
+    normalizedLang.startsWith("ja-")
+  ) {
     if (value >= 1e8) return `${(value / 1e8).toFixed(2)} 亿`;
     if (value >= 1e4) return `${(value / 1e4).toFixed(decimals)} 万`;
     return value.toLocaleString();
+  }
+  if (normalizedLang === "ko" || normalizedLang.startsWith("ko-")) {
+    if (value >= 1e8) return `${(value / 1e8).toFixed(2)}억`;
+    if (value >= 1e4) return `${(value / 1e4).toFixed(decimals)}만`;
+    return value.toLocaleString("ko-KR");
   }
   if (value >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
   if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
